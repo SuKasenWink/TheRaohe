@@ -7,6 +7,7 @@ use egui::{
 use egui::epaint::text::VariationCoords;
 use egui_extras::{Column, TableBuilder};
 use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -182,13 +183,17 @@ pub struct AppState {
     pub proc_query: String,
     pub show_system: bool,
     pub results: Vec<ResultEntry>,
-    pub selected: Option<usize>,
+    // 結果集世代: 每次清空/整体替換 +1, 靜默刷新用它判斷自己手裡的副本是不是陳的
+    pub(crate) results_epoch: u64,
+    // 位址 -> 選中時的原始值, refresh 後比對即得「自選中後變更」
+    pub selected: HashMap<u64, u64>,
+    // agent 正在看的位址: 最後一次 results 請求起累加, 結果替換時清空
+    pub(crate) agent_view: HashSet<u64>,
     pub scanning: bool,
     pub hex_addr: u64,
     pub hex: Vec<u8>,
     pub events: Vec<egui::Event>,
     pub hit_rects: Vec<egui::Rect>,
-    pub mcp_port: u16,
     pub advanced_open: bool,
     pub type_open: bool,
     pub cond_open: bool,
@@ -231,13 +236,14 @@ impl AppState {
             proc_query: String::new(),
             show_system: false,
             results: Vec::new(),
-            selected: None,
+            results_epoch: 1,
+            selected: HashMap::new(),
+            agent_view: HashSet::new(),
             scanning: false,
             hex_addr: 0,
             hex: Vec::new(),
             events: Vec::new(),
             hit_rects: Vec::new(),
-            mcp_port: 8080,
             advanced_open: false,
             type_open: true,
             cond_open: true,
@@ -255,13 +261,13 @@ impl AppState {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    fn refresh_procs(&mut self) {
+    pub(crate) fn refresh_procs(&mut self) {
         self.procs = mem::list_processes();
         self.status = format!("{} 個行程", self.procs.len());
         self.bump();
     }
 
-    fn attach(&mut self, pid: i32) {
+    pub(crate) fn attach(&mut self, pid: i32) {
         let name = self
             .procs
             .iter()
@@ -274,7 +280,9 @@ impl AppState {
         self.map_checked = self.maps.iter().map(is_scannable).collect();
         self.module_base = mem::main_module(&self.maps);
         self.results.clear();
-        self.selected = None;
+        self.results_epoch += 1;
+        self.selected.clear();
+        self.agent_view.clear();
         self.input.clear();
         self.tab = Tab::Maps;
         if self.maps.is_empty() {
@@ -300,7 +308,9 @@ impl AppState {
     fn select_slot(&mut self, slot: TypeSlot) {
         self.scan_slot = slot;
         self.results.clear();
-        self.selected = None;
+        self.results_epoch += 1;
+        self.selected.clear();
+        self.agent_view.clear();
         self.input.clear();
         self.status = format!("掃描類型：{}", slot.label(self.signed));
         self.bump();
@@ -309,7 +319,9 @@ impl AppState {
     fn set_signed(&mut self, signed: bool) {
         self.signed = signed;
         self.results.clear();
-        self.selected = None;
+        self.results_epoch += 1;
+        self.selected.clear();
+        self.agent_view.clear();
         self.status = format!("掃描類型：{}", self.scan_slot.label(signed));
         self.bump();
     }
@@ -359,18 +371,15 @@ impl AppState {
         self.bump();
     }
 
-    fn set_mcp_port(&mut self, text: String) {
-        if let Ok(port) = text.parse::<u16>() {
-            self.mcp_port = port;
+    fn toggle_result(&mut self, index: usize) {
+        let Some(entry) = self.results.get(index) else {
+            return;
+        };
+        let addr = entry.addr;
+        if self.selected.remove(&addr).is_none() {
+            self.selected.insert(addr, entry.bits);
         }
-        self.bump();
-    }
-
-    fn select_result(&mut self, index: usize) {
-        self.selected = Some(index);
-        if let Some(entry) = self.results.get(index) {
-            self.status = format!("已選擇 0x{:x}", entry.addr);
-        }
+        self.status = format!("已選中 {} 項", self.selected.len());
         self.bump();
     }
 
@@ -436,7 +445,7 @@ pub fn push_touch(
 }
 
 #[derive(Clone, Debug)]
-enum UiAction {
+pub(crate) enum UiAction {
     Tab(Tab),
     RefreshProcs,
     Attach(i32),
@@ -449,7 +458,6 @@ enum UiAction {
     SetProcQuery(String),
     SetShowSystem(bool),
     SetRefreshInterval(f32),
-    SetMcpPort(String),
     SetShortcutEnabled(Shortcut, bool),
     CaptureScreenshot,
     ToggleAdvanced,
@@ -457,14 +465,14 @@ enum UiAction {
     ToggleCondOpen,
     StartScan,
     StartRefine,
-    SelectResult(usize),
+    ToggleResultSelect(usize),
     RefreshHex,
     RequestClose,
     CancelClose,
     ConfirmClose,
 }
 
-fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
+pub(crate) fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
     match action {
         UiAction::StartScan => {
             start_scan(app);
@@ -510,7 +518,6 @@ fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
             state.refresh_interval = v;
             state.bump();
         }
-        UiAction::SetMcpPort(text) => state.set_mcp_port(text),
         UiAction::SetShortcutEnabled(shortcut, enabled) => {
             shortcut.set_enabled(&mut state, enabled);
             state.bump();
@@ -522,7 +529,7 @@ fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
         UiAction::ToggleAdvanced => state.toggle_advanced(),
         UiAction::ToggleTypeOpen => state.toggle_type_open(),
         UiAction::ToggleCondOpen => state.toggle_cond_open(),
-        UiAction::SelectResult(index) => state.select_result(index),
+        UiAction::ToggleResultSelect(index) => state.toggle_result(index),
         UiAction::RefreshHex => state.refresh_hex(),
         UiAction::RequestClose => state.set_close_confirm_open(true),
         UiAction::CancelClose => state.set_close_confirm_open(false),
@@ -547,7 +554,7 @@ fn selected_maps(state: &AppState) -> Vec<MapRegion> {
     }
 }
 
-fn start_scan(app: &Arc<Mutex<AppState>>) {
+pub(crate) fn start_scan(app: &Arc<Mutex<AppState>>) {
     let job = {
         let mut state = match app.lock() {
             Ok(v) => v,
@@ -587,13 +594,15 @@ fn start_scan(app: &Arc<Mutex<AppState>>) {
             state.scanning = false;
             state.status = format!("掃描完成，找到 {} 個結果", found.len());
             state.results = found;
-            state.selected = None;
+            state.results_epoch += 1;
+            state.selected.clear();
+            state.agent_view.clear();
             state.bump();
         }
     });
 }
 
-fn start_refine(app: &Arc<Mutex<AppState>>) {
+pub(crate) fn start_refine(app: &Arc<Mutex<AppState>>) {
     let job = {
         let mut state = match app.lock() {
             Ok(v) => v,
@@ -633,7 +642,9 @@ fn start_refine(app: &Arc<Mutex<AppState>>) {
             state.scanning = false;
             state.status = format!("篩選完成，剩 {} 個結果", found.len());
             state.results = found;
-            state.selected = None;
+            state.results_epoch += 1;
+            state.selected.clear();
+            state.agent_view.clear();
             state.bump();
         }
     });
@@ -653,14 +664,18 @@ fn refresh_results_silent(app: &Arc<Mutex<AppState>>) {
             return;
         }
         let ty = state.scan_slot.ty(state.signed);
-        (state.pid, ty, state.results.clone())
+        (state.pid, ty, state.results.clone(), state.results_epoch)
     };
     let app = Arc::clone(app);
     std::thread::spawn(move || {
         let entries = mem::refresh_entries(job.0, job.1, &job.2);
         if let Ok(mut state) = app.lock() {
+            // 副本陳化守護: 快照期間結果被清空/替換過, 這次的刷新直接作廢
+            if state.results_epoch != job.3 {
+                return;
+            }
             state.results = entries;
-            state.selected = None;
+            // 同一輪: 以實刷新結果, 不變動世代
             state.bump();
         }
     });
@@ -915,7 +930,7 @@ fn configure_style(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
-fn apply_actions(app: &Arc<Mutex<AppState>>, actions: Vec<UiAction>) {
+pub(crate) fn apply_actions(app: &Arc<Mutex<AppState>>, actions: Vec<UiAction>) {
     for action in actions {
         apply_action(app, action);
     }
@@ -925,7 +940,7 @@ fn is_scannable(map: &MapRegion) -> bool {
     map.perms.contains('r') && map.perms.contains('w') && !map.path.starts_with("/dev/")
 }
 
-fn hex_bytes(bits: u64, size: usize) -> String {
+pub(crate) fn hex_bytes(bits: u64, size: usize) -> String {
     let mut s = String::new();
     for i in 0..size {
         if i > 0 {
@@ -1571,6 +1586,14 @@ fn condition_row(
 }
 
 fn draw_results(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
+    egui::Panel::bottom("scan-results-bottom")
+        .resizable(false)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let theme = ui.visuals().selection.bg_fill;
+            ui.label(egui::RichText::new("主題色=選中").background_color(theme));
+        });
+
     if state.results.is_empty() {
         ui.label("尚無結果，請先附加行程並掃描");
         return;
@@ -1581,10 +1604,14 @@ fn draw_results(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>
     let w = ui.available_width();
     let addr_w = (w * 0.36).min(200.0);
     let raw_w = (w * 0.30).min(260.0);
-    TableBuilder::new(ui)
+    // TableBuilder 的欄分隔線以父 ui 的 min_rect 為底, 而 Panel::show 會把底欄 rect
+    // 併進父 min_rect, 分隔線會穿透底欄, 故表格包一層 scope 隔離
+    ui.scope(|ui| {
+        TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
         .vscroll(true)
+        .sense(egui::Sense::click())
         .drag_to_scroll(egui::scroll_area::DragScroll::Always)
         .column(Column::initial(addr_w).at_least(40.0).clip(true))
         .column(Column::initial(raw_w).at_least(40.0).clip(true))
@@ -1604,6 +1631,15 @@ fn draw_results(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>
             body.rows(24.0, state.results.len(), |mut row| {
                 let idx = row.index();
                 let entry = &state.results[idx];
+                let addr = entry.addr;
+                // 自選中後變更: 黃字
+                let changed = state
+                    .selected
+                    .get(&addr)
+                    .is_some_and(|&bits| bits != entry.bits);
+                row.set_selected(
+                    state.selected.contains_key(&addr) || state.agent_view.contains(&addr),
+                );
                 row.col(|ui| {
                     let text = format!("0x{:012x}", entry.addr);
                     let resp = ui.add(
@@ -1614,25 +1650,35 @@ fn draw_results(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>
                     if resp.clicked() {
                         let copy = format!("0x{:x} = {}", entry.addr, ty.format(entry.bits));
                         ui.ctx().copy_text(copy);
-                        actions.push(UiAction::SelectResult(idx));
                     }
                 });
                 row.col(|ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(hex_bytes(entry.bits, size)).monospace(),
-                        )
-                        .truncate(),
-                    );
+                    let text = egui::RichText::new(hex_bytes(entry.bits, size)).monospace();
+                    let text = if changed {
+                        text.color(CHANGED_COLOR)
+                    } else {
+                        text
+                    };
+                    ui.add(egui::Label::new(text).truncate());
                 });
                 row.col(|ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(ty.format(entry.bits))).truncate(),
-                    );
+                    let text = egui::RichText::new(ty.format(entry.bits));
+                    let text = if changed {
+                        text.color(CHANGED_COLOR)
+                    } else {
+                        text
+                    };
+                    ui.add(egui::Label::new(text).truncate());
                 });
+                if row.response().clicked() {
+                    actions.push(UiAction::ToggleResultSelect(idx));
+                }
             });
         });
+    });
 }
+
+const CHANGED_COLOR: Color32 = Color32::from_rgb(255, 200, 0);
 
 fn draw_hex(ui: &mut egui::Ui, state: &AppState) {
     ScrollArea::vertical()
@@ -1721,23 +1767,6 @@ fn draw_settings(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction
                 }
             });
         });
-
-    egui::CollapsingHeader::new("MCP")
-        .default_open(true)
-        .show(ui, |ui| {
-            settings_row(ui, "端口", |ui| {
-                let mut text = state.mcp_port.to_string();
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut text)
-                        .hint_text("端口")
-                        .char_limit(5)
-                        .desired_width(100.0),
-                );
-                if resp.changed() {
-                    actions.push(UiAction::SetMcpPort(text));
-                }
-            });
-        });
 }
 
 fn settings_row(ui: &mut egui::Ui, label: &str, add_value: impl FnOnce(&mut egui::Ui)) {
@@ -1776,7 +1805,6 @@ fn draw_bottom_bar(ui: &mut egui::Ui, state: &AppState) {
     } else {
         "核心驅動未連接".to_string()
     });
-    items.push(format!("MCP http://localhost:{}", state.mcp_port));
     if !state.status.is_empty() {
         items.push(truncate(&state.status, 48));
     }
