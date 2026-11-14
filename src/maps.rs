@@ -184,14 +184,31 @@ pub fn read_maps(pid: i32) -> Vec<MapRegion> {
     out
 }
 
+/// 主模組基底: 取「有可執行段的路徑」中總對應尺寸最大者的 offset==0 段位 (PUBGM 的 libUE4.so
+/// 被大量匿名/隱藏 VMA 夾雜其前, 只看 argv/maps 順序第一個執行段會撞上 PixUI 這類小外掛)
 pub fn main_module(maps: &[MapRegion]) -> u64 {
-    maps.iter()
-        .find(|m| m.perms.contains('x') && !m.path.is_empty() && m.offset == 0)
-        .map(|m| m.start)
-        .or_else(|| {
-            maps.iter()
-                .find(|m| m.perms.contains('x') && !m.path.is_empty())
-                .map(|m| m.start)
-        })
+    use std::collections::HashMap;
+    let mut size_by_path: HashMap<&str, u64> = HashMap::new();
+    let mut has_rx_by_path: HashMap<&str, bool> = HashMap::new();
+    let mut base_by_path: HashMap<&str, u64> = HashMap::new();
+    for m in maps {
+        if m.path.is_empty() {
+            continue;
+        }
+        *size_by_path.entry(m.path.as_str()).or_default() += m.end - m.start;
+        if m.perms.contains('x') {
+            has_rx_by_path.insert(m.path.as_str(), true);
+        }
+        if m.offset == 0 {
+            base_by_path.entry(m.path.as_str()).or_insert(m.start);
+        }
+    }
+    size_by_path
+        .into_iter()
+        // 僅檔案映射的 ELF 類路徑; 虛擬機/堆匿名 VMA (項目最多 rwxp 一兩個 JIT 頁) 會把總和堆出假大數
+        .filter(|(p, _)| p.starts_with('/') && p.ends_with(".so"))
+        .filter(|(p, _)| has_rx_by_path.get(p).copied().unwrap_or(false) && base_by_path.contains_key(p))
+        .max_by_key(|&(_, size)| size)
+        .map(|(p, _)| base_by_path[p])
         .unwrap_or(0)
 }

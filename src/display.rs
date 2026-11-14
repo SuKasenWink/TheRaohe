@@ -1,12 +1,18 @@
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 static SCREEN_WH: AtomicU64 = AtomicU64::new(0);
-static SCREEN_ROT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+// 當前行程觀察到的 rotation (0..3), 與 SCREEN_WH 同源 (parse 一起寫), 供 Lua 自瞄旋轉閘用
+static SCREEN_ROT: AtomicU32 = AtomicU32::new(0);
+
+/// 最近一次 query() 觀察到的 rotation (0..3); 沒觀察到時回 0
+pub fn rotation() -> u32 {
+    SCREEN_ROT.load(Ordering::Relaxed)
+}
 
 /// Lua API 等唯讀用途: 回傳最近一次 query() 觀測到的物理像素寬高
 pub fn screen_wh() -> Option<(i32, i32)> {
@@ -15,19 +21,6 @@ pub fn screen_wh() -> Option<(i32, i32)> {
         return Some(((packed >> 32) as u32 as i32, (packed & 0xffffffff) as u32 as i32));
     }
     query().map(|i| (i.width, i.height))
-}
-
-/// 寬高與旋轉方向的最近一次觀測值; 虛擬觸控按下時需要方向來換算座標
-pub fn screen_info() -> Option<(i32, i32, i32)> {
-    let packed = SCREEN_WH.load(Ordering::Relaxed);
-    if packed != 0 {
-        return Some((
-            (packed >> 32) as u32 as i32,
-            (packed & 0xffffffff) as u32 as i32,
-            SCREEN_ROT.load(Ordering::Relaxed),
-        ));
-    }
-    query().map(|i| (i.width, i.height, i.rotation))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +92,7 @@ pub fn parse(text: &str) -> Option<ScreenInfo> {
         return None;
     }
     SCREEN_WH.store(((width as u64) << 32) | height as u64, Ordering::Relaxed);
-    SCREEN_ROT.store(rotation, Ordering::Relaxed);
+    SCREEN_ROT.store(rotation as u32, Ordering::Relaxed);
     Some(ScreenInfo {
         width,
         height,

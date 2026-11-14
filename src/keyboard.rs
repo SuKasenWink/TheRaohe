@@ -3,7 +3,73 @@
 //! 按鍵通過向 ctx 注入 egui 事件與輸入框協作, 每次按鍵後搶回焦點
 //! 宿主只需在每幀 widget 繪製之前呼叫 pump_events, 並在繪製後呼叫 show
 
-use egui::{vec2, Align, Button, Context, Event, Id, Key, Layout, Modifiers, Order, Rect, Window};
+use egui::{vec2, Align, Button, Context, Event, Id, Key, Layout, Modifiers, Order, ProgressBar, Rect, RichText, Window};
+use std::time::{Duration, Instant};
+
+/// 應用內剪切板: 複製內容以浮窗呈現, 點擊內容延長 30 秒; 倒計時結束即離開作用域
+/// 窗口位置由 egui Memory 記住, 關閉重開位置不變; 宿主只需 copy + show, 無其他耦合
+pub struct Clipboard {
+    entry: Option<ClipEntry>,
+}
+
+struct ClipEntry {
+    text: String,
+    expires: Instant,
+}
+
+const CLIP_TTL_SECS: u64 = 30;
+
+impl Default for Clipboard {
+    fn default() -> Self {
+        Self { entry: None }
+    }
+}
+
+impl Clipboard {
+    pub fn copy(&mut self, text: String) {
+        self.entry = Some(ClipEntry {
+            text,
+            expires: Instant::now() + Duration::from_secs(CLIP_TTL_SECS),
+        });
+    }
+
+    fn clear_expired(&mut self) {
+        if self.entry.as_ref().is_some_and(|e| e.expires <= Instant::now()) {
+            self.entry = None;
+        }
+    }
+
+    /// 畫剪切板窗口; 回傳其 rect 供宿主做命中測試
+    pub fn show(&mut self, ctx: &Context) -> Option<Rect> {
+        self.clear_expired();
+        // 位置由 egui Memory 記住, 窗口關閉後重開位置不變
+        let ClipEntry { text, expires } = self.entry.as_mut()?;
+        let remain = expires.saturating_duration_since(Instant::now());
+        let secs = remain.as_secs_f32();
+        let frac = (secs / CLIP_TTL_SECS as f32).clamp(0.0, 1.0);
+        let screen = ctx.content_rect();
+        let response = Window::new("剪切板")
+            .id(Id::unique("theraohe-clipboard"))
+            .resizable(false)
+            .movable(true)
+            .collapsible(true)
+            .default_pos(egui::pos2(screen.width() * 0.05, screen.height() * 0.15))
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(Button::new(RichText::new(&*text).monospace().size(20.0)))
+                        .clicked()
+                    {
+                        *expires += Duration::from_secs(CLIP_TTL_SECS);
+                    }
+                    ui.label(RichText::new(format!("{}s", secs.ceil() as u32)).monospace().small());
+                });
+                ui.add(ProgressBar::new(frac).desired_height(3.0));
+            });
+        response.map(|r| r.response.rect)
+    }
+}
 
 const KB_ROWS: [&[&str]; 5] = [
     &["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],

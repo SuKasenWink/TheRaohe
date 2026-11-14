@@ -9,10 +9,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use mlua::{Function, Lua, Value};
+
+// 自瞄專用虛擬手指: 固定佔用第 9 槽 (1<<9), 不與使用者常用的低位槽競爭
+const AIM_TOUCH_SLOT: u16 = 1 << 9;
 
 pub struct LuaScript {
     // 先 drop 基準(持有 ValueRef), 再 drop Lua, 順序不能反
@@ -24,7 +27,7 @@ pub struct LuaScript {
     pub error: Option<String>,
 }
 
-/// Lua 回呼在 AppState 鎖內(按鈕/ draw_lua)或鎖外(init)都可能觸發,
+/// Lua 回呼在 AppState 鎖內(按鈕/ draw_lua)或鎖外(Begin)都可能觸發,
 /// 直接操作 AppState 會重入死鎖; 一律入隊, 由 UI 側在安全點排空套用
 pub enum LuaCmd {
     SelectName(String),
@@ -271,6 +274,58 @@ fn register_api(lua: &Lua) -> mlua::Result<()> {
     })?;
     t.set("screen_size", screen_size)?;
 
+    // 自瞄手指: 屏幕物理像素座標, 絕對定位; driver 佈局依當前 rotation 決定 (init 會隨之重設)
+    // 呼叫成功回傳 true, 目標未就緒/驅動拒絕回傳 false
+    // 0 = 未初始化; 非零 = 當前已 init 的 rotation
+    static AIM_TOUCH_LAYOUT: AtomicU32 = AtomicU32::new(0);
+    fn ensure_touch_init(rot: u32) -> bool {
+        if AIM_TOUCH_LAYOUT.load(Ordering::Relaxed) == rot {
+            return true;
+        }
+        let Some((w, h)) = crate::display::screen_wh() else {
+            return false;
+        };
+        // rotation=3 已對齊, rotation=1 只改了 X 軸 (xi=1080-y); 兩者的觸控範圍都是 (1080,2400)
+        let ok = crate::nb9::touch_init(h, w);
+        if ok {
+            AIM_TOUCH_LAYOUT.store(rot, Ordering::Relaxed);
+        }
+        ok
+    }
+    // landscape 下 w (2400) = 未旋轉手機的螢幕高; 反射 X 軸即 yi = w - x
+    let pt_w = crate::display::screen_wh().map(|(w, _)| w as f64).unwrap_or(2400.0);
+    // 未旋轉手機的螢幕闊度 = landscape 高度 = h (1080)
+    let pt_h = crate::display::screen_wh().map(|(_, h)| h as f64).unwrap_or(1080.0);
+    // rotation=3 (充電口在左) 已對齊: 軸向互換 + X 軸反彈;
+    // rotation=1 (充電口在右) 直送原始值, 待使用者確認偏移方向後再精修
+    // 其餘 rotation 的觸控不輸出
+    const AIM_ALLOWED_ROTATION: u32 = 3;
+    const AIM_RAW_ROTATION: u32 = 1;
+    let mk_touch = |cmd: u32| {
+        lua.create_function(move |_, (x, y): (f64, f64)| -> mlua::Result<bool> {
+            if !x.is_finite() || !y.is_finite() {
+                return Ok(false);
+            }
+            let rot = crate::display::rotation();
+            let (xi, yi) = match rot {
+                AIM_ALLOWED_ROTATION => (
+                    y.clamp(0.0, f64::from(u32::MAX)) as u32,
+                    (pt_w - x).clamp(0.0, f64::from(u32::MAX)) as u32,
+                ),
+                AIM_RAW_ROTATION => (
+                    // X = 未旋轉螢幕闊度 (1080) - Lua Y; Y 軸未調校
+                    (pt_h - y).clamp(0.0, f64::from(u32::MAX)) as u32,
+                    x.clamp(0.0, f64::from(u32::MAX)) as u32,
+                ),
+                _ => return Ok(false),
+            };
+            Ok(ensure_touch_init(rot) && crate::nb9::touch_event(cmd, xi, yi, AIM_TOUCH_SLOT))
+        })
+    };
+    t.set("touch_down", mk_touch(crate::nb9::TOUCH_DOWN)?)?;
+    t.set("touch_move", mk_touch(crate::nb9::TOUCH_MOVE)?)?;
+    t.set("touch_up", mk_touch(crate::nb9::TOUCH_UP)?)?;
+
     lua.globals().set("theraohe", t)?;
     Ok(())
 }
@@ -397,15 +452,15 @@ pub fn call_tick(script: &mut LuaScript) {
     }
 }
 
-/// init() 約定: 宿主(egui)就緒且行程表掃描完成後自動呼叫一次;
+/// Begin() 約定: 宿主(egui)就緒且行程表掃描完成後自動呼叫一次;
 /// 非零參/不存在則靜默跳過, 錯誤寫入 script.error 供 UI 顯示
-pub fn call_init(script: &mut LuaScript) {
+pub fn call_begin(script: &mut LuaScript) {
     let is_zero_arg_fn = matches!(
-        script.lua.globals().get::<Value>("init"),
+        script.lua.globals().get::<Value>("Begin"),
         Ok(Value::Function(f)) if f.info().num_params == 0
     );
     if is_zero_arg_fn {
-        call(script, "init");
+        call(script, "Begin");
     }
 }
 

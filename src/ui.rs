@@ -1,4 +1,4 @@
-﻿use crate::keyboard::Keyboard;
+use crate::keyboard::Keyboard;
 use crate::lua_env;
 use crate::maps::{self, MapRegion};
 use crate::mem::{self, ChangeMode, ProcInfo, ResultEntry, ValueType};
@@ -9,43 +9,65 @@ use egui::{
 use egui::epaint::text::VariationCoords;
 use egui_extras::{Column, TableBuilder};
 use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 // 純黑背景 (AMOLED); 按鈕/控制項的預設樣式原封不動, 只有底色改黑
 const HEX_LEN: usize = 4096;
 
-/// Sentinel used as a drop index: append at the very end.
-const SHORTCUT_LAYOUT_END: usize = usize::MAX;
-
-/// Location of an item inside a row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ChipLocation {
-    pub row: usize,
-    pub chip: usize,
+/// 大組 header 回傳給外層的事件, 避開借用檢查
+#[derive(Default)]
+struct GroupFlags {
+    start_rename: bool,
+    exit_rename: bool,
+    delete: bool,
+    toggle_free_position: bool,
+    add_row: bool,
+    delete_rows: Vec<usize>,
 }
 
-/// Unified payload for the vertical (row) and horizontal (chip) dnd,
+/// Sentinel used as a drop index: append at the very end.
+const SHORTCUT_END: usize = usize::MAX;
+
+/// Location of a bar inside a 大組.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowLocation {
+    group: usize,
+    row: usize,
+}
+
+/// Location of an item inside a bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChipLocation {
+    group: usize,
+    row: usize,
+    chip: usize,
+}
+
+/// Unified payload for the vertical (bar) and horizontal (chip) dnd,
 /// so a payload that reaches the "wrong" handler is never silently discarded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DragPayload {
-    /// A whole row — the vertical dnd.
-    Row(usize),
-    /// An item inside a row — the horizontal dnd.
+    /// A whole bar — the vertical dnd.
+    Row(RowLocation),
+    /// An item inside a bar — the horizontal dnd.
     Chip(ChipLocation),
 }
 
-// 佈局示意的佔位資料, 尚未對應真實捷徑
-fn default_shortcut_layout() -> Vec<Vec<String>> {
-    [
-        vec!["捷徑 1", "捷徑 2", "捷徑 3", "捷徑 4"],
-        vec!["捷徑 5", "捷徑 6", "捷徑 7"],
-        vec!["捷徑 8", "捷徑 9", "捷徑 10", "捷徑 11"],
-    ]
-    .into_iter()
-    .map(|row| row.into_iter().map(str::to_owned).collect())
-    .collect()
+/// 捷徑大組: 一個項目是 (label) 一個字串; 每個大組會以獨立懸浮窗呈現 N×M 按鈕
+#[derive(Clone, PartialEq, Eq)]
+pub struct ShortcutGroup {
+    /// Stable identity for window id; survives renames and re-sorting.
+    pub id: u64,
+    /// Name shown as the CollapsingHeader label; also used as the window title.
+    pub name: String,
+    /// rows -> items; rows reorder vertically, items reorder horizontally inside each row.
+    pub rows: Vec<Vec<String>>,
+    /// 可否自由移動此懸浮窗; false = 鎖位置不可拖動
+    pub free_position: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,47 +88,23 @@ impl Tab {
             Tab::Proc => "行程",
             Tab::Maps => "映射",
             Tab::Scan => "掃描",
-            Tab::Hex => "十六進位制轉儲",
+            Tab::Hex => "Hex Dump",
             Tab::Lua => "Lua",
             Tab::Settings => "設置",
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Shortcut {
-    Screenshot,
-    Console,
-}
+/// 捷徑內建候補動作 (Lua 反射出的函式在 shortcut_sync 時自動加入候選區)
+pub const SHORTCUT_BUILTIN: [&str; 2] = ["截圖", "終端台"];
 
-impl Shortcut {
-    pub const ALL: [Shortcut; 2] = [Shortcut::Screenshot, Shortcut::Console];
-
-    fn label(self) -> &'static str {
-        match self {
-            Shortcut::Screenshot => "截圖",
-            Shortcut::Console => "終端台",
-        }
-    }
-
-    fn enabled(self, state: &AppState) -> bool {
-        match self {
-            Shortcut::Screenshot => state.shortcut_screenshot,
-            Shortcut::Console => state.shortcut_console,
-        }
-    }
-
-    fn set_enabled(self, state: &mut AppState, value: bool) {
-        match self {
-            Shortcut::Screenshot => state.shortcut_screenshot = value,
-            Shortcut::Console => state.shortcut_console = value,
-        }
-    }
-
-    fn action(self) -> UiAction {
-        match self {
-            Shortcut::Screenshot => UiAction::CaptureScreenshot,
-            Shortcut::Console => UiAction::ToggleConsole,
+impl ShortcutGroup {
+    fn new(id: u64, name: &str) -> Self {
+        ShortcutGroup {
+            id,
+            name: name.to_owned(),
+            rows: Vec::new(),
+            free_position: true,
         }
     }
 }
@@ -413,21 +411,31 @@ pub struct AppState {
     pub type_open: bool,
     pub cond_open: bool,
     pub refresh_interval: f32,
-    pub shortcut_screenshot: bool,
-    pub shortcut_console: bool,
+    /// hex 頁專用的重新整理間隙, 與掃描結果的 refresh_interval 各自獨立
+    pub hex_refresh_interval: f32,
+    /// 待交給鍵盤/剪切板組件的複製內容; 組件取得後清空
+    pub clip_pending: Option<String>,
+    /// hex 頁頂部的位址跳轉滑塊值(選擇行程時自動塡入主模組基座位址)
+    pub hex_addr_input: f64,
+    /// hex 頁自動重新整理開關
+    pub hex_autorefresh: bool,
+    // 捷徑: 每個大組是一個獨立懸浮窗, 內按鈕呈 N×M 填滿; 候選區為未配置的截圖/終端台/反射 Lua 函式
+    pub shortcut_groups: Vec<ShortcutGroup>,
+    pub shortcut_trailing: Vec<String>,
+    pub shortcut_renaming: Option<usize>,
+    pub shortcut_rename_focus: bool,
+    pub shortcut_id_next: u64,
+    /// 上一幀主按鈕按住的捷徑清單 (Lua 標籤), 每幀由 render() 重填; render_frame 在 Lua Tick 時消費
+    pub shortcut_held: Vec<String>,
     pub console_open: bool,
     /// 每腳本一個獨立 Lua 狀態; 載入時與每次呼叫/寫回後重算反射
     pub lua_scripts: Vec<lua_env::LuaScript>,
-    // 捷徑區目前僅作拖放佈局示意, 不對應懸浮窗, 亦不持久化
-    pub shortcut_layout: Vec<Vec<String>>,
     pub screenshot_pending: bool,
     pub screenshot_result: Option<Result<String, String>>,
     pub close_confirm_open: bool,
     pub collapse_toggle: std::sync::atomic::AtomicBool,
     /// 狀態欄像素高度 (開機時讀一次；熱旋轉不更新)
     pub status_bar_h: i32,
-    pub touch_targets: Vec<crate::touch_targets::TouchTarget>,
-    pub ppp: f32,
 }
 
 impl AppState {
@@ -480,25 +488,30 @@ impl AppState {
             advanced_open: false,
             type_open: true,
             cond_open: true,
-            refresh_interval: 1.0,
-            shortcut_screenshot: true,
-            shortcut_console: true,
+            refresh_interval: 0.25,
+            hex_refresh_interval: 0.25,
+            hex_addr_input: 0.0,
+            hex_autorefresh: false,
+            clip_pending: None,
             console_open: false,
             lua_scripts: lua_env::load_all(),
-            shortcut_layout: default_shortcut_layout(),
+            shortcut_groups: vec![ShortcutGroup::new(1, "捷徑 1")],
+            shortcut_trailing: Vec::new(),
+            shortcut_renaming: None,
+            shortcut_rename_focus: false,
+            shortcut_id_next: 2,
+            shortcut_held: Vec::new(),
             screenshot_pending: false,
             screenshot_result: None,
             close_confirm_open: std::env::var_os("THERAOHE_DBG_CLOSE").is_some(),
             collapse_toggle: std::sync::atomic::AtomicBool::new(false),
             status_bar_h,
-            touch_targets: Vec::new(),
-            ppp: 2.0,
         };
-        // 此時 egui 宿主已建立、行程表已掃描完: 自動呼叫各腳本 init(), 再排空 Lua 發出的命令
+        // 此時 egui 宿主已建立、行程表已掃描完: 自動呼叫各腳本 Begin(), 再排空 Lua 發出的命令
         lua_env::set_target_info(0, 0);
         lua_env::set_module_index(&state.maps);
         for script in &mut state.lua_scripts {
-            lua_env::call_init(script);
+            lua_env::call_begin(script);
         }
         apply_lua_cmds(&mut state);
         state
@@ -542,6 +555,8 @@ impl AppState {
         lua_env::set_module_index(&self.maps);
         self.map_checked = self.maps.iter().map(maps::default_map_checked).collect();
         self.module_base = maps::main_module(&self.maps);
+        // 選擇行程時自動塡入主模組基座位址作爲跳轉預設值
+        self.hex_addr_input = self.module_base as f64;
         self.last_scan_bytes = None;
         self.clear_results();
         self.input.clear();
@@ -792,7 +807,10 @@ pub(crate) enum UiAction {
     Tab(Tab),
     RefreshProcs,
     Attach(i32),
-    MapBase,
+    SetHexAddrInput(f64),
+    JumpHexAddr,
+    ToggleHexAutorefresh,
+    CopyText(String),
     ToggleMap(usize),
     ScanSlot(TypeSlot),
     SetSigned(bool),
@@ -801,9 +819,7 @@ pub(crate) enum UiAction {
     SetProcQuery(String),
     SetShowSystem(bool),
     SetRefreshInterval(f32),
-    SetShortcutEnabled(Shortcut, bool),
-    ShortcutLayoutMoveRow { from: usize, to: usize },
-    ShortcutLayoutMoveChip { from: ChipLocation, to: ChipLocation },
+    SetHexRefreshInterval(f32),
     CaptureScreenshot,
     ToggleConsole,
     ToggleAdvanced,
@@ -824,42 +840,140 @@ pub(crate) enum UiAction {
     ConfirmClose,
 }
 
-// 索引越界時直接放棄本次移動, 佈局示意不值得為此 panic
-fn move_shortcut_layout_chip(layout: &mut [Vec<String>], from: ChipLocation, mut to: ChipLocation) {
-    if to.row == SHORTCUT_LAYOUT_END {
-        // Dropped on empty space: append at the end of the last row.
-        to.row = layout.len().saturating_sub(1);
+/// `[<script-stem>]<function>` → (stem, function); 非合法格式回傳 None
+pub(crate) fn parse_shortcut_label(item: &str) -> Option<(String, String)> {
+    let rest = item.strip_prefix('[')?;
+    let (stem, func) = rest.split_once(']')?;
+    if stem.is_empty() || func.is_empty() {
+        return None;
     }
-    if from.row >= layout.len() || to.row >= layout.len() {
-        return;
-    }
-    if from.chip >= layout[from.row].len() {
-        return;
-    }
-    if from.row == to.row {
-        // Adjust the chip index if we are re-ordering within the same row.
-        to.chip -= (from.chip < to.chip) as usize;
-    }
-    let chip = layout[from.row].remove(from.chip);
-    to.chip = to.chip.min(layout[to.row].len());
-    layout[to.row].insert(to.chip, chip);
+    Some((stem.to_string(), func.to_string()))
 }
 
-fn move_shortcut_layout_row(layout: &mut Vec<Vec<String>>, from: usize, mut to: usize) {
-    if from >= layout.len() {
+/// 內建捷徑 → UiAction; Lua 函式標籤一律交給 render_frame 在 Lua Tick 時呼叫 (不經前端點擊), 回傳 None
+fn shortcut_trigger(label: &str) -> Option<UiAction> {
+    match label {
+        "截圖" => return Some(UiAction::CaptureScreenshot),
+        "終端台" => return Some(UiAction::ToggleConsole),
+        _ => {}
+    }
+    None
+}
+
+/// 依現有 Lua 反射重算候選清單: 內定的截圖/終端台 + 每腳本零參全局函式（Tick 除外）,
+/// 未被指派到任何大組/候選區的新函式自動入列, 已消失的反射項自動移除
+fn sync_shortcut_candidates(state: &mut AppState) {
+    let mut cand: Vec<String> = SHORTCUT_BUILTIN.iter().map(|s| s.to_string()).collect();
+    for script in &state.lua_scripts {
+        let stem = script
+            .file_name
+            .strip_suffix(".lua")
+            .unwrap_or(&script.file_name)
+            .to_string();
+        for f in &script.functions {
+            if f == "Tick" {
+                continue;
+            }
+            cand.push(format!("[{stem}]{f}"));
+        }
+    }
+    let set: std::collections::HashSet<&str> = cand.iter().map(|s| s.as_str()).collect();
+    for group in &mut state.shortcut_groups {
+        for row in &mut group.rows {
+            row.retain(|s| set.contains(s.as_str()));
+        }
+    }
+    state.shortcut_trailing.retain(|s| set.contains(s.as_str()));
+    let mut placed: HashSet<String> = state.shortcut_trailing.iter().map(|s| s.clone()).collect();
+    for group in &state.shortcut_groups {
+        for row in &group.rows {
+            for s in row {
+                placed.insert(s.clone());
+            }
+        }
+    }
+    for c in cand {
+        if !placed.contains(&c) {
+            state.shortcut_trailing.push(c);
+        }
+    }
+}
+
+/// 取出 chip 容器; 目標行不存在時自動補一行空的, 使空大組的「佔位行」也能接收拖放
+fn chip_vec(state: &mut AppState, loc: RowLocation) -> Option<&mut Vec<String>> {
+    if loc.group == SHORTCUT_END {
+        return Some(&mut state.shortcut_trailing);
+    }
+    let group = state.shortcut_groups.get_mut(loc.group)?;
+    if loc.row >= group.rows.len() {
+        group.rows.resize(loc.row + 1, Vec::new());
+    }
+    Some(&mut group.rows[loc.row])
+}
+
+fn move_chip(state: &mut AppState, from: ChipLocation, mut to: ChipLocation) {
+    if to.group == SHORTCUT_END && to.row == SHORTCUT_END {
+        // 丟在空白處: 附加到候選區尾端
+        to.row = 0;
+    }
+    if from.group != SHORTCUT_END && from.group >= state.shortcut_groups.len() {
         return;
     }
-    if from < to {
-        // Dragging downwards: removing the row shifts the target down by one.
-        to -= 1;
+    if to.group != SHORTCUT_END && to.group >= state.shortcut_groups.len() {
+        return;
     }
-    let row = layout.remove(from);
-    to = to.min(layout.len());
-    layout.insert(to, row);
+    if from.group == to.group && from.row == to.row {
+        // 同列插入: 若目標在原位之右, 先行移除會讓目標左移一格
+        to.chip = to.chip.saturating_sub((from.chip < to.chip) as usize);
+    }
+    let chip = match chip_vec(state, RowLocation { group: from.group, row: from.row })
+        .and_then(|v| if from.chip < v.len() { Some(v.remove(from.chip)) } else { None })
+    {
+        Some(c) => c,
+        None => return,
+    };
+    if let Some(dest) = chip_vec(state, RowLocation { group: to.group, row: to.row }) {
+        to.chip = to.chip.min(dest.len());
+        dest.insert(to.chip, chip);
+    }
+}
+
+fn move_row(state: &mut AppState, from: RowLocation, mut to: RowLocation) {
+    if to.group == SHORTCUT_END {
+        // 大組被整條拖到候選區: 拆成 chip 附加到尾端
+        if from.group < state.shortcut_groups.len() {
+            let group = &mut state.shortcut_groups[from.group];
+            if from.row < group.rows.len() {
+                let row = group.rows.remove(from.row);
+                state.shortcut_trailing.extend(row);
+            }
+        }
+        return;
+    }
+    if from.group >= state.shortcut_groups.len() || to.group >= state.shortcut_groups.len() {
+        return;
+    }
+    if from.group == to.group && from.row == to.row {
+        return;
+    }
+    let row = {
+        let group = &mut state.shortcut_groups[from.group];
+        if from.row >= group.rows.len() {
+            return;
+        }
+        group.rows.remove(from.row)
+    };
+    let dest = &mut state.shortcut_groups[to.group].rows;
+    if from.group == to.group && from.row < to.row {
+        // 同大組下移: 移除一列後目標上移一格
+        to.row -= 1;
+    }
+    to.row = to.row.min(dest.len());
+    dest.insert(to.row, row);
 }
 
 /// 排空 Lua 發出的命令並套用到 state; 與 apply_actions 同一個模式(鎖外收集、鎖內套用),
-/// init() 在 AppState::new 裡呼叫時走這裡, 按鈕觸發時 render() 每幀呼叫一次
+/// Begin() 在 AppState::new 裡呼叫時走這裡, 按鈕觸發時 render() 每幀呼叫一次
 pub(crate) fn apply_lua_cmds(state: &mut AppState) {
     for cmd in lua_env::drain_cmds() {
         match cmd {
@@ -936,14 +1050,16 @@ pub(crate) fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
         }
         UiAction::RefreshProcs => state.refresh_procs(),
         UiAction::Attach(pid) => state.attach(pid),
-        UiAction::MapBase => {
-            let base = state.module_base;
-            if base != 0 {
-                state.open_hex(base);
-            } else {
-                state.status = "尚未找到模組基底".to_string();
-                state.bump();
-            }
+        UiAction::SetHexAddrInput(v) => {
+            state.hex_addr_input = v;
+        }
+        UiAction::JumpHexAddr => {
+            let addr = state.hex_addr_input as u64;
+            state.open_hex(addr);
+        }
+        UiAction::ToggleHexAutorefresh => {
+            state.hex_autorefresh = !state.hex_autorefresh;
+            state.bump();
         }
         UiAction::ToggleMap(idx) => state.toggle_map(idx),
         UiAction::ScanSlot(slot) => state.select_slot(slot),
@@ -959,16 +1075,8 @@ pub(crate) fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
             state.refresh_interval = v;
             state.bump();
         }
-        UiAction::SetShortcutEnabled(shortcut, enabled) => {
-            shortcut.set_enabled(&mut state, enabled);
-            state.bump();
-        }
-        UiAction::ShortcutLayoutMoveRow { from, to } => {
-            move_shortcut_layout_row(&mut state.shortcut_layout, from, to);
-            state.bump();
-        }
-        UiAction::ShortcutLayoutMoveChip { from, to } => {
-            move_shortcut_layout_chip(&mut state.shortcut_layout, from, to);
+        UiAction::SetHexRefreshInterval(v) => {
+            state.hex_refresh_interval = v;
             state.bump();
         }
         UiAction::ToggleConsole => {
@@ -1009,6 +1117,10 @@ pub(crate) fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
             state.bump();
         }
         UiAction::RefreshHex => state.refresh_hex(),
+        UiAction::CopyText(text) => {
+            state.clip_pending = Some(text);
+            state.bump();
+        }
         UiAction::RequestClose => state.set_close_confirm_open(true),
         UiAction::CancelClose => state.set_close_confirm_open(false),
         UiAction::ConfirmClose => {
@@ -1356,6 +1468,32 @@ fn refresh_results_silent(app: &Arc<Mutex<AppState>>) {
     });
 }
 
+fn refresh_hex_silent(app: &Arc<Mutex<AppState>>) {
+    let job = {
+        let state = match app.lock() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if state.pid <= 0 {
+            return;
+        }
+        (state.pid, state.hex_addr)
+    };
+    // 讀取失敗時保留舊轉儲, 與掃描輪詢失敗時保留舊值一致
+    let dump = crate::mem::hex_dump(job.0, job.1, HEX_LEN);
+    if dump.is_empty() {
+        return;
+    }
+    if let Ok(mut state) = app.lock() {
+        // 轉儲是鎖外讀取, 期間位址可能已被改動 (例如 MCP 跳轉), 舊轉儲直接作廢
+        if state.hex_addr != job.1 {
+            return;
+        }
+        state.hex = dump;
+        state.bump();
+    }
+}
+
 fn prefetch_struct_windows(app: &Arc<Mutex<AppState>>, addrs: Vec<u64>) {
     let job = {
         let mut state = match app.lock() {
@@ -1447,12 +1585,14 @@ pub struct UiHost {
     ctx: egui::Context,
     renderer: EguiSoftwareRender,
     keyboard: Keyboard,
+    clipboard: crate::keyboard::Clipboard,
     start: Instant,
     last_rev: u64,
     last_visible: bool,
     last_size: (usize, usize),
     last_screen: (usize, usize),
     last_auto_refresh: Instant,
+    last_hex_refresh: Instant,
     layer_offset: (f32, f32),
     frames: u64,
 }
@@ -1493,12 +1633,14 @@ impl UiHost {
             ctx,
             renderer,
             keyboard: Keyboard::default(),
+            clipboard: crate::keyboard::Clipboard::default(),
             start: Instant::now(),
             last_rev: 0,
             last_visible: false,
             last_size: (0, 0),
             last_screen: (0, 0),
             last_auto_refresh: Instant::now(),
+            last_hex_refresh: Instant::now(),
             layer_offset: (0.0, 0.0),
             frames: 0,
         })
@@ -1519,12 +1661,14 @@ impl UiHost {
         if screen_w == 0 || screen_h == 0 {
             return false;
         }
-        let (revision, visible, events, scanning, want_capture, refresh_interval, results_len, interval_slot) = {
+        let (revision, visible, events, scanning, want_capture, refresh_interval, hex_refresh_interval, results_len, interval_slot, hex_autorefresh, on_hex) = {
             let mut state = match app.lock() {
                 Ok(v) => v,
                 Err(_) => return false,
             };
             let want_capture = std::mem::take(&mut state.screenshot_pending);
+            // 每幀都重填, 這裡先清空; 沒畫出捷徑窗口時保持為空
+            state.shortcut_held.clear();
             (
                 state.revision,
                 state.visible,
@@ -1532,8 +1676,11 @@ impl UiHost {
                 state.scanning,
                 want_capture,
                 state.refresh_interval,
+                state.hex_refresh_interval,
                 state.scan.typed.len(),
                 state.scan_slot.is_interval(),
+                state.hex_autorefresh,
+                matches!(state.tab, Tab::Hex),
             )
         };
         if want_capture {
@@ -1596,6 +1743,12 @@ impl UiHost {
             && refresh_interval > 0.0
             && self.last_auto_refresh.elapsed().as_secs_f32() >= refresh_interval;
 
+        // hex 頁自動重新整理只在 hex 頁生效; 讀到異常位址時保留舊轉儲不動
+        let hex_refresh_due = hex_autorefresh
+            && on_hex
+            && hex_refresh_interval > 0.0
+            && self.last_hex_refresh.elapsed().as_secs_f32() >= hex_refresh_interval;
+
         self.last_visible = true;
         self.last_size = (width, height);
         self.last_screen = (screen_w, screen_h);
@@ -1604,6 +1757,11 @@ impl UiHost {
         if auto_refresh_due {
             self.last_auto_refresh = Instant::now();
             refresh_results_silent(app);
+        }
+
+        if hex_refresh_due {
+            self.last_hex_refresh = Instant::now();
+            refresh_hex_silent(app);
         }
 
         let spinner = if scanning {
@@ -1637,11 +1795,13 @@ impl UiHost {
                 Err(_) => return false,
             };
             crate::lua_env::set_target_info(state.pid, state.module_base);
-            state.ppp = ppp;
             self.ctx.run_pass(raw, |ctx| {
                 self.keyboard.pump_events(ctx);
                 draw_ui(ctx, &mut state, &mut actions, &mut hit_rects, spinner);
                 if let Some(rect) = self.keyboard.show(ctx) {
+                    hit_rects.push(rect.expand(8.0));
+                }
+                if let Some(rect) = self.clipboard.show(ctx) {
                     hit_rects.push(rect.expand(8.0));
                 }
             })
@@ -1653,6 +1813,10 @@ impl UiHost {
         apply_actions(app, actions);
         if let Ok(mut state) = app.lock() {
             apply_lua_cmds(&mut state);
+            // 複製請求經 AppState 過一手交給鍵盤/剪切板組件
+            if let Some(text) = std::mem::take(&mut state.clip_pending) {
+                self.clipboard.copy(text);
+            }
         }
 
         for px in buf[..width * height].iter_mut() {
@@ -1692,6 +1856,9 @@ fn configure_style(ctx: &egui::Context) {
     // 做縮放換算；ctx 建立後第一幀沒有上一幀，會量到 egui 的默認 5000x5000，
     // 把窗口默認尺寸撐爆並永久 persist。直接寫 options，讓第一幀就拿到正確 ppp。
     ctx.options_mut(|o| o.zoom_factor = 2.0);
+    // 捷徑按鈕/Lua 自瞄要「按住」而非「按到時限 = 長按」;
+    // 禁用 egui 長觸控 (情境選單) 觸發, 不然按鈕約 0.8s 後會「彈起」
+    ctx.options_mut(|o| o.input_options.max_click_duration = f64::INFINITY);
     ctx.set_theme(egui::ThemePreference::Dark);
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = Color32::BLACK;
@@ -1857,6 +2024,9 @@ fn draw_ui(
     spinner: usize,
 ) {
     hit_rects.clear();
+    // shortcut_held collects the Lua labels whose buttons are actively held this frame;
+    // the Lua Tick in render_frame fires the corresponding Lua functions (never the front-end click path)
+    let mut shortcut_held: Vec<String> = Vec::new();
     let screen = ctx.content_rect();
     // content_rect 是邏輯尺寸 (= 物理尺寸 / zoom), 窗口按邏輯比例取值, 物理比例不隨 zoom 變
     // 主 UI 尺寸不分方向都以短邊 90% 為邊長的正方形, 物理大小旋轉後不變
@@ -1892,13 +2062,10 @@ fn draw_ui(
             // 全屏底栏（所有页面共享）— 必须先加入，才能橫跨整個窗口寬度
             egui::Panel::bottom("window_status_bar")
                 .resizable(false)
-                .show(ui, |ui| draw_bottom_bar(ui, state));
+                .show(ui, |ui| draw_bottom_bar(ui, state, actions));
 
             let footer_labels: &[(&str, UiAction)] = match state.tab {
-                Tab::Hex => &[
-                    ("重新整理", UiAction::RefreshHex),
-                    ("模組基底", UiAction::MapBase),
-                ],
+                Tab::Hex => &[("重新整理", UiAction::RefreshHex)],
                 _ => &[],
             };
             if !footer_labels.is_empty() {
@@ -1955,7 +2122,7 @@ fn draw_ui(
                 Tab::Proc => draw_procs(ui, state, actions),
                 Tab::Maps => draw_maps(ui, state, actions),
                 Tab::Scan => draw_results(ui, state, actions),
-                Tab::Hex => draw_hex(ui, state),
+                Tab::Hex => draw_hex(ui, state, actions),
                 Tab::Lua => draw_lua(ui, state),
                 Tab::Settings => draw_settings(ui, state, actions),
             });
@@ -1967,28 +2134,53 @@ fn draw_ui(
         hit_rects.push(r.response.rect.expand(8.0));
     }
 
-    // 常駐小窗口: 依設置裡的捷徑清單排按鈕, 冇任何輸入
-    let enabled: Vec<Shortcut> = Shortcut::ALL
-        .into_iter()
-        .filter(|s| s.enabled(state))
-        .collect();
-    if !enabled.is_empty() {
+    // 常駐小窗口: 每個有內容的大組一個獨立窗口, 標題跟設置裡的名字走,
+    // 窗口內的 chip 按 N×M 填滿鋪開; 候選名單 (Lua 反射) 不落在任何窗口
+    if !state.shortcut_groups.is_empty() {
         let shortcut_fill = Color32::from_black_alpha(128);
         let mut shortcut_style = (*ctx.style_of(egui::Theme::Dark)).clone();
         // 整窗半透明黑, 標題行不單獨上色 → 沿用窗口底色
         shortcut_style.visuals.window_fill = shortcut_fill;
         shortcut_style.visuals.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
         let window_frame = egui::Frame::window(&shortcut_style).shadow(egui::Shadow::NONE);
-        if let Some(r) = egui::Window::new("捷徑")
-            .id(egui::Id::unique("theraohe-shortcuts"))
-            .collapsible(true)
-            .resizable(true)
-            .movable(true)
-            .default_pos(egui::pos2(screen.width() - 150.0, screen.height() * 0.5))
-            .order(egui::Order::Foreground)
-            .frame(window_frame)
-            .show(ctx, |ui| {
-                let s = ui.style_mut();
+        let mut idx = 0usize;
+        for group_idx in 0..state.shortcut_groups.len() {
+            let rows_filled: Vec<Vec<String>> = state.shortcut_groups[group_idx]
+                .rows
+                .iter()
+                .filter(|r| !r.is_empty())
+                .cloned()
+                .collect();
+            if rows_filled.is_empty() {
+                continue;
+            }
+            let group_id = state.shortcut_groups[group_idx].id;
+            let name = state.shortcut_groups[group_idx].name.clone();
+            let max_chips = rows_filled.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+            // 定值格寬, 窗口寬度只按最長列算; 追蹤內容/spacing 做到不外漲
+            const ITEM_W: f32 = 140.0;
+            let default_w = max_chips as f32 * ITEM_W
+                + max_chips.saturating_sub(1) as f32 * 8.0
+                + 16.0;
+            let rows_n = rows_filled.len() as f32;
+            let default_h = (rows_n * 96.0).max(80.0);
+            let default_pos = egui::pos2(
+                screen.width() - default_w + 20.0 + (idx as f32 * 24.0),
+                screen.height() * 0.5 - (rows_n * 96.0) * 0.5 + (idx as f32 * 40.0),
+            );
+            idx += 1;
+            if let Some(r) = egui::Window::new(&name)
+                .id(egui::Id::unique(("theraohe-shortcuts", group_id)))
+                .collapsible(true)
+                .resizable(true)
+                .movable(state.shortcut_groups[group_idx].free_position)
+                .default_pos(default_pos)
+                .default_size(vec2(default_w, default_h))
+                .max_size(vec2(screen.width(), screen.height()))
+                .order(egui::Order::Foreground)
+                .frame(window_frame)
+                .show(ctx, |ui| {
+                    let s = ui.style_mut();
                     s.visuals.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
                     for widget in [
                         &mut s.visuals.widgets.inactive,
@@ -1997,18 +2189,39 @@ fn draw_ui(
                     ] {
                         widget.weak_bg_fill = widget.weak_bg_fill.gamma_multiply(0.5);
                     }
-                    for shortcut in &enabled {
-                        if ui.button(RichText::new(shortcut.label()).size(20.0)).clicked() {
-                            actions.push(shortcut.action());
+                    let rows_n = rows_filled.len() as f32;
+                    let avail_h = ui.available_height();                    // 同 egui reference: 列高扣掉列間距後均分 — 不留剩餘空隙, 也不帶動窗口增長
+                    let row_h = ((avail_h - ui.spacing().item_spacing.y * (rows_n - 1.0)) / rows_n).max(0.0);
+                    ui.vertical(|ui| {
+                        for row in rows_filled.iter() {
+                            ui.allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
+                                ui.columns(row.len(), |cols| {
+                                    for (col, chip) in cols.iter_mut().zip(row) {
+                                        // 捷徑按鈕要「按住即持續」, 手指滑動不能被 egui 當成取消點擊 —
+                                        // 走 click_and_drag sense, 移動超時 egui 仍會將其視為活躍拖曳目標 (key for 自瞄按住)
+                                        let resp = col.add_sized(
+                                            col.available_size(),
+                                            Button::new(chip).sense(egui::Sense::click_and_drag()),
+                                        );
+                                        if resp.is_pointer_button_down_on() {
+                                            shortcut_held.push(chip.clone());
+                                        }
+                                        if resp.clicked() {
+                                            if let Some(a) = shortcut_trigger(chip) {
+                                                actions.push(a);
+                                            }
+                                        }
+                                    }
+                                });
+                            });
                         }
-                    }
-            })
-        {
-            hit_rects.push(r.response.rect.expand(8.0));
+                    });
+                })
+            {
+                hit_rects.push(r.response.rect.expand(8.0));
+            }
         }
     }
-
-    crate::touch_targets::draw(ctx, state, hit_rects);
 
     if state.console_open {
         let mut console_open = true;
@@ -2068,6 +2281,7 @@ fn draw_ui(
             actions.push(UiAction::CancelClose);
         }
     }
+    state.shortcut_held = shortcut_held;
 }
 
 fn draw_toolbar(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
@@ -2752,15 +2966,13 @@ fn draw_results(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>
         return;
     }
 
-    if state.scan.typed.is_empty() {
-        ui.label("尚無結果，請先附加行程並掃描");
-        return;
+    if !state.scan.typed.is_empty() {
+        ui.label(format!(
+            "{} 個結果（權威源：{}）",
+            state.scan.typed.len(),
+            state.scan.authority.label()
+        ));
     }
-    ui.label(format!(
-        "{} 個結果（權威源：{}）",
-        state.scan.typed.len(),
-        state.scan.authority.label()
-    ));
     let ty = state.scan_slot.ty(state.signed);
     let size = ty.size();
     let w = ui.available_width();
@@ -2899,41 +3111,85 @@ fn format_float_bits(ty: ValueType, bits: u64) -> String {
 const CHANGED_COLOR: Color32 = Color32::from_rgb(255, 45, 85);
 const STRUCT_ANCHOR_COLOR: Color32 = Color32::from_rgb(135, 206, 250);
 
-fn draw_hex(ui: &mut egui::Ui, state: &AppState) {
-    ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            if state.hex.is_empty() {
-                ui.label("尚無資料");
-                return;
-            }
-            for (row, chunk) in state.hex.chunks(16).enumerate() {
-                let addr = state.hex_addr + (row * 16) as u64;
-                let mut line = format!("{addr:012x}  ");
-                for i in 0..16 {
-                    if let Some(b) = chunk.get(i) {
-                        line.push_str(&format!("{b:02x} "));
-                    } else {
-                        line.push_str("   ");
-                    }
-                }
-                line.push(' ');
-                for b in chunk {
-                    line.push(if (0x20..=0x7e).contains(b) {
-                        *b as char
-                    } else {
-                        '.'
-                    });
-                }
-                ui.add(egui::Label::new(egui::RichText::new(line).monospace()).truncate());
-            }
+fn draw_hex(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
+    ui.horizontal(|ui| {
+        if ui.button("跳轉:").clicked() {
+            actions.push(UiAction::JumpHexAddr);
+        }
+        let mut addr = state.hex_addr_input;
+        if ui
+            .add(egui::DragValue::new(&mut addr).hexadecimal(10, false, false))
+            .changed()
+        {
+            actions.push(UiAction::SetHexAddrInput(addr));
+        }
+        if ui
+            .add(Button::selectable(state.hex_autorefresh, "自動重新整理"))
+            .clicked()
+        {
+            actions.push(UiAction::ToggleHexAutorefresh);
+        }
+    });
+    ui.add_space(4.0);
+    let row_count = state.hex.chunks(16).len();
+    let w = ui.available_width();
+    let addr_w = (w * 0.28).min(140.0);
+    let hex_w = (w * 0.52).min(360.0);
+    ui.spacing_mut().item_spacing.y = 4.0;
+    let row_h = ui.spacing().interact_size.y;
+    TableBuilder::new(ui)
+        .striped(true)
+        .resizable(true)
+        .vscroll(true)
+        .drag_to_scroll(egui::scroll_area::DragScroll::Always)
+        .column(Column::initial(addr_w).at_least(64.0).clip(true))
+        .column(Column::initial(hex_w).at_least(72.0).clip(true))
+        .column(Column::remainder().at_least(48.0).clip(true))
+        .header(20.0, |mut header| {
+            header.col(|ui| {
+                ui.label("地址");
+            });
+            header.col(|ui| {
+                ui.label("字節");
+            });
+            header.col(|ui| {
+                ui.label("ASCII");
+            });
+        })
+        .body(|body| {
+            body.rows(row_h, row_count, |mut row| {
+                let start = row.index() * 16;
+                let chunk = &state.hex[start..(start + 16).min(state.hex.len())];
+                let addr = state.hex_addr + start as u64;
+                row.col(|ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(format!("{addr:012x}")).monospace()).truncate());
+                });
+                row.col(|ui| {
+                    let text = chunk
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    ui.add(egui::Label::new(egui::RichText::new(text).monospace()).truncate());
+                });
+                row.col(|ui| {
+                    let ascii: String = chunk
+                        .iter()
+                        .map(|b| {
+                            if (0x20..=0x7e).contains(b) {
+                                *b as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect();
+                    ui.add(egui::Label::new(egui::RichText::new(ascii).monospace()).truncate());
+                });
+            });
         });
 }
 
 fn draw_lua(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.heading("Lua");
-    ui.add_space(6.0);
-
     let Some(dir) = lua_env::dir() else {
         ui.label("無法定位二進制路徑");
         return;
@@ -2969,7 +3225,8 @@ fn draw_lua_script(ui: &mut egui::Ui, state: &mut AppState, idx: usize) {
         ui.add_space(4.0);
     }
 
-    let functions = script.functions.clone();
+    // Tick 是每幀回呼, 不是可點擊的動作; 每幀重建列表故 clone 順手過濾
+    let functions: Vec<String> = script.functions.iter().filter(|f| *f != "Tick").cloned().collect();
     let variables = script.variables.clone();
     if functions.is_empty() && variables.is_empty() {
         ui.label(RichText::new("(無反射項目)").color(Color32::GRAY));
@@ -2989,63 +3246,145 @@ fn draw_lua_script(ui: &mut egui::Ui, state: &mut AppState, idx: usize) {
     }
 
     if !variables.is_empty() {
-        ui.label("變數");
-        for name in &variables {
-            draw_lua_variable(ui, idx, name, state);
-        }
+        ui.label("變量");
+        // 行內流式排版, 與掃描頁「條件」同款行為: 超寬換行
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for name in &variables {
+                draw_lua_variable(ui, idx, name, state);
+            }
+        });
     }
+}
+
+/// measure_mono: {name}: 相同 monospace 字型量測寬度, chip 估算內容寬用
+fn measure_mono(ui: &mut egui::Ui, text: &str) -> f32 {
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let color = ui.visuals().text_color();
+    ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font_id, color).size().x)
+}
+
+/// 變量 chip 外殼: 手動 allocate_space + painter 畫框, 與掃描頁「條件」chip 同款;
+/// Frame::group 在 horizontal_wrapped 裡不會正確推進游標 (父佈局分行決策過晚), 內容溢出不換行
+fn lua_variable_chip(ui: &mut egui::Ui, content_w: f32, add: impl FnOnce(&mut egui::Ui)) {
+    const MARGIN: f32 = 6.0;
+    let interact_h = ui.spacing().interact_size.y;
+    let inner_w = content_w;
+    let corner_radius = ui.visuals().widgets.noninteractive.corner_radius;
+    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    let (_id, rect) = ui.allocate_space(egui::vec2(inner_w + 2.0 * MARGIN, interact_h + 2.0 * MARGIN));
+    ui.painter().rect_stroke(rect, corner_radius, stroke, egui::StrokeKind::Inside);
+    let mut content = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink(MARGIN))
+            .sense(egui::Sense::hover())
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    content.spacing_mut().item_spacing.x = 6.0;
+    add(&mut content);
+}
+
+/// egui 沒有內建 toggle switch; 自繪軌道 + 圓點 (手機原生開關樣式)
+/// 開關樣式跟主題色同源: off = noninteractive 背景, on = selection 色
+fn toggle_switch(ui: &mut egui::Ui, id_source: (usize, &str), checked: &mut bool) -> egui::Response {
+    const WIDTH: f32 = 34.0;
+    const HEIGHT: f32 = 18.0;
+    let desired = egui::vec2(WIDTH, HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    if response.clicked() {
+        *checked = !*checked;
+    }
+    let t = ui
+        .ctx()
+        .animate_bool_responsive(ui.make_persistent_id(id_source), *checked);
+    let corner = egui::CornerRadius::same(HEIGHT as u8 / 2);
+    let off_bg = ui.visuals().widgets.noninteractive.bg_fill;
+    let on_bg = ui.visuals().selection.bg_fill;
+    let bg = off_bg.lerp_to_gamma(on_bg, t);
+    ui.painter().rect_filled(rect, corner, bg);
+    let knob_r = (HEIGHT - 4.0) * 0.5;
+    let x0 = rect.left() + 2.0 + knob_r;
+    let x1 = rect.right() - 2.0 - knob_r;
+    let cx = x0 + (x1 - x0) * t;
+    let cy = rect.center().y;
+    let knob = ui.visuals().text_color();
+    ui.painter().circle_filled(egui::pos2(cx, cy), knob_r, knob);
+    ui.painter().circle_stroke(
+        egui::pos2(cx, cy),
+        knob_r,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
+    response
 }
 
 fn draw_lua_variable(ui: &mut egui::Ui, idx: usize, name: &str, state: &mut AppState) {
     use mlua::Value;
     let script = &mut state.lua_scripts[idx];
     let value = script.lua.globals().get::<Value>(name).unwrap_or(Value::Nil);
-    ui.horizontal(|ui| {
-        match value {
-            Value::Integer(mut x) => {
-                ui.label(RichText::new(name).monospace());
-                if ui.add(egui::DragValue::new(&mut x)).changed() {
+    match value {
+        Value::Integer(mut x) => {
+            let label = format!("{name}:");
+            let content_w = measure_mono(ui, &label) + 6.0 + 64.0;
+            lua_variable_chip(ui, content_w, |ui| {
+                ui.label(RichText::new(label).monospace());
+                if ui.add(egui::DragValue::new(&mut x).speed(1)).changed() {
                     lua_env::set_global(script, name, Value::Integer(x));
                 }
-            }
-            Value::Number(x) => {
-                let mut v = x;
-                ui.label(RichText::new(name).monospace());
-                if ui.add(egui::DragValue::new(&mut v)).changed() {
+            });
+        }
+        Value::Number(mut v) => {
+            let label = format!("{name}:");
+            let content_w = measure_mono(ui, &label) + 6.0 + 80.0;
+            lua_variable_chip(ui, content_w, |ui| {
+                ui.label(RichText::new(label).monospace());
+                if ui
+                    .add(egui::DragValue::new(&mut v).speed(0.001).max_decimals(4))
+                    .changed()
+                {
                     lua_env::set_global(script, name, Value::Number(v));
                 }
-            }
-            Value::Boolean(b) => {
-                let mut v = b;
-                if ui.checkbox(&mut v, name).changed() {
-                    lua_env::set_global(script, name, Value::Boolean(v));
+            });
+        }
+        Value::Boolean(mut b) => {
+            let label = format!("{name}:");
+            let content_w = measure_mono(ui, &label) + 6.0 + 34.0;
+            lua_variable_chip(ui, content_w, |ui| {
+                ui.label(RichText::new(label).monospace());
+                if toggle_switch(ui, (idx, name), &mut b).clicked() {
+                    lua_env::set_global(script, name, Value::Boolean(b));
                 }
-            }
-            Value::String(s) => {
-                let mut v = s.to_string_lossy();
-                ui.label(RichText::new(name).monospace());
-                if ui.add(egui::TextEdit::singleline(&mut v)).changed() {
-                    match script.lua.create_string(v) {
-                        Ok(ls) => lua_env::set_global(script, name, Value::String(ls)),
-                        Err(e) => script.error = Some(format!("{name}: {e}")),
+            });
+        }
+        other => {
+            ui.horizontal(|ui| {
+                match other {
+                    Value::String(s) => {
+                        let mut v = s.to_string_lossy();
+                        ui.label(RichText::new(name).monospace());
+                        if ui.add(egui::TextEdit::singleline(&mut v)).changed() {
+                            match script.lua.create_string(v) {
+                                Ok(ls) => lua_env::set_global(script, name, Value::String(ls)),
+                                Err(e) => script.error = Some(format!("{name}: {e}")),
+                            }
+                        }
+                    }
+                    kind => {
+                        let label = match kind {
+                            Value::Nil => "nil",
+                            Value::Table(_) => "table",
+                            Value::Function(_) => "function",
+                            Value::Thread(_) => "thread",
+                            Value::UserData(_) => "userdata",
+                            Value::LightUserData(_) => "lightuserdata",
+                            Value::Error(_) => "error",
+                            _ => "other",
+                        };
+                        ui.label(RichText::new(format!("{name} = <{label}>")).monospace());
                     }
                 }
-            }
-            other => {
-                let kind = match other {
-                    Value::Nil => "nil",
-                    Value::Table(_) => "table",
-                    Value::Function(_) => "function",
-                    Value::Thread(_) => "thread",
-                    Value::UserData(_) => "userdata",
-                    Value::LightUserData(_) => "lightuserdata",
-                    Value::Error(_) => "error",
-                    _ => "other",
-                };
-                ui.label(RichText::new(format!("{name} = <{kind}>")).monospace());
-            }
+            });
         }
-    });
+    }
 }
 
 /// Insertion indicator, derived from the active theme (no hard-coded colors).
@@ -3053,175 +3392,348 @@ fn insertion_stroke(ui: &egui::Ui, width: f32) -> egui::Stroke {
     egui::Stroke::new(width, ui.visuals().selection.stroke.color)
 }
 
-fn draw_shortcut_layout(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
-    // If there is a drop, store the item being dragged, and the destination for the drop.
-    let mut row_from = None;
-    let mut row_to = None;
-    let mut chip_from = None;
-    let mut chip_to = None;
-
-    let (_, empty_drop) = ui.dnd_drop_zone::<DragPayload, ()>(Frame::new(), |ui| {
-        ui.vertical(|ui| {
-            for (row_idx, chips) in state.shortcut_layout.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    // Left grip: the vertical dnd drag handle.
-                    ui.dnd_drag_source(
-                        egui::Id::unique(("shortcut_layout_bar", row_idx)),
-                        DragPayload::Row(row_idx),
-                        |ui| {
-                            ui.label("⠿").on_hover_text("拖曳整行上下排序");
-                        },
-                    );
-
-                    let (zone, bar_drop) = ui.dnd_drop_zone::<DragPayload, ()>(Frame::new(), |ui| {
+fn draw_shortcut_layout(ui: &mut egui::Ui, state: &mut AppState, _actions: &mut Vec<UiAction>) {
+    sync_shortcut_candidates(state);
+    let mut row_from: Option<RowLocation> = None;
+    let mut row_to: Option<RowLocation> = None;
+    let mut chip_from: Option<ChipLocation> = None;
+    let mut chip_to: Option<ChipLocation> = None;
+    ui.horizontal(|ui| {
+        if ui.button("+ 新增窗口").clicked() {
+            let id = state.shortcut_id_next;
+            state.shortcut_id_next += 1;
+            state.shortcut_groups.push(ShortcutGroup::new(id, &format!("捷徑 {id}")));
+            state.bump();
+        }
+    });
+    ui.add_space(4.0);
+    let mut to_delete: Vec<usize> = Vec::new();
+    for group_idx in 0..state.shortcut_groups.len() {
+        let group_id = state.shortcut_groups[group_idx].id;
+        let name_show = state.shortcut_groups[group_idx].name.clone();
+        let state_free_position = state.shortcut_groups[group_idx].free_position;
+        let rows: Vec<Vec<String>> = state.shortcut_groups[group_idx].rows.clone();
+        let is_renaming = state.shortcut_renaming == Some(group_idx);
+        let rename_focus = std::mem::take(&mut state.shortcut_rename_focus);
+        let state_id = ui.make_persistent_id(("shortcut_group", group_id));
+        let name_buf = Rc::new(RefCell::new(name_show.clone()));
+        let flags = Rc::new(RefCell::new(GroupFlags::default()));
+        {
+            let name_show2 = name_show.clone();
+            let name_buf2 = Rc::clone(&name_buf);
+            let flags2 = Rc::clone(&flags);
+            let flags_row = Rc::clone(&flags);
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), state_id, true)
+                .show_header(ui, |ui| {
+                    if is_renaming {
+                        let mut t = name_buf2.borrow_mut();
+                        let response = ui.text_edit_singleline(&mut *t);
+                        if rename_focus {
+                            response.request_focus();
+                        }
+                        if response.lost_focus() {
+                            flags2.borrow_mut().exit_rename = true;
+                        }
+                    } else {
+                        let free_pos = state_free_position;
                         ui.horizontal(|ui| {
-                            for (chip_idx, chip) in chips.iter().enumerate() {
-                                let chip_location = ChipLocation {
-                                    row: row_idx,
-                                    chip: chip_idx,
-                                };
-                                let chip_id =
-                                    egui::Id::unique(("shortcut_layout_chip", row_idx, chip_idx));
-
-                                let chip_response = ui
-                                    .dnd_drag_source(chip_id, DragPayload::Chip(chip_location), |ui| {
-                                        ui.label(chip);
-                                    })
-                                    .response;
-
-                                let rect = chip_response.rect;
-                                let pointer = ui.input(|i| i.pointer.interact_pos());
-                                let insert_chip_idx =
-                                    if pointer.is_some_and(|p| p.x < rect.center().x) {
-                                        chip_idx
-                                    } else {
-                                        chip_idx + 1
-                                    };
-
-                                // Preview insertion:
-                                if let (Some(pointer), Some(hovered_payload)) = (
-                                    pointer,
-                                    chip_response.dnd_hover_payload::<DragPayload>(),
-                                ) {
-                                    if let DragPayload::Chip(hovered_loc) = *hovered_payload {
-                                        let stroke = insertion_stroke(ui, 1.0);
-                                        if hovered_loc == chip_location {
-                                            // We are dragged onto ourselves
-                                            ui.painter().vline(rect.center().x, rect.y_range(), stroke);
-                                        } else if pointer.x < rect.center().x {
-                                            // Left of us
-                                            ui.painter().vline(rect.left(), rect.y_range(), stroke);
-                                        } else {
-                                            // Right of us
-                                            ui.painter().vline(rect.right(), rect.y_range(), stroke);
-                                        }
-                                    }
-                                }
-
-                                // Detect drops onto this chip:
-                                if let (Some(pointer), Some(dragged_payload)) =
-                                    (pointer, chip_response.dnd_release_payload())
+                            ui.label(&name_show2);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new("刪除").fill(Color32::from_rgb(200, 40, 40)))
+                                    .on_hover_text("刪除此窗口，其中的按鈕回到候選區")
+                                    .clicked()
                                 {
-                                    match *dragged_payload {
-                                        DragPayload::Chip(from_loc) => {
-                                            chip_from = Some(from_loc);
-                                            chip_to = Some(ChipLocation {
-                                                row: row_idx,
-                                                chip: insert_chip_idx,
-                                            });
-                                        }
-                                        DragPayload::Row(from_row) => {
-                                            // Row dropped on a chip:
-                                            // vertical insert above/below this row.
-                                            row_from = Some(from_row);
-                                            row_to = Some(if pointer.y < rect.center().y {
-                                                row_idx
-                                            } else {
-                                                row_idx + 1
-                                            });
-                                        }
-                                    }
+                                    flags2.borrow_mut().delete = true;
+                                }
+                                ui.add_space(2.0);
+                                if ui
+                                    .selectable_label(free_pos, "自由位置")
+                                    .on_hover_text("勾選後懸浮窗可被拖動改變位置")
+                                    .clicked()
+                                {
+                                    flags2.borrow_mut().toggle_free_position = true;
+                                }
+                                ui.add_space(2.0);
+                                if ui.button("改名").clicked() {
+                                    flags2.borrow_mut().start_rename = true;
+                                }
+                            });
+                        });
+                    }
+                })
+                .body(|ui| {
+                    if ui.button("+新增Row").on_hover_text("在大組內加一條空行").clicked() {
+                        flags.borrow_mut().add_row = true;
+                    }
+                    ui.add_space(2.0);
+                    let rows_draw: Vec<&Vec<String>> = rows.iter().collect();
+                    for (row_idx, row) in rows_draw.into_iter().enumerate() {
+                        let row_loc = RowLocation {
+                            group: group_idx,
+                            row: row_idx,
+                        };
+                        ui.horizontal(|ui| {
+                            bar_ui(
+                                ui,
+                                row_loc,
+                                row,
+                                true,
+                                &mut row_from,
+                                &mut row_to,
+                                &mut chip_from,
+                                &mut chip_to,
+                            );
+                            // 刪除此列; 其內項目全部彈回候選區
+                            if row_idx < rows.len() {
+                                if ui
+                                    .button("刪除")
+                                    .on_hover_text("刪除此列，內容回到候選區")
+                                    .clicked()
+                                {
+                                    flags_row.borrow_mut().delete_rows.push(row_idx);
                                 }
                             }
                         });
-                    });
-
-                    // Row-level preview: a horizontal line above/below the row.
-                    if let (Some(pointer), Some(hovered_payload)) = (
-                        ui.input(|i| i.pointer.interact_pos()),
-                        zone.response.dnd_hover_payload::<DragPayload>(),
-                    ) {
-                        if let DragPayload::Row(hovered_row) = *hovered_payload {
-                            let rect = zone.response.rect;
-                            let stroke = insertion_stroke(ui, 2.0);
-                            if hovered_row == row_idx {
-                                // We are dragged onto ourselves
-                                ui.painter().hline(rect.x_range(), rect.center().y, stroke);
-                            } else if pointer.y < rect.center().y {
-                                // Above us
-                                ui.painter().hline(rect.x_range(), rect.top(), stroke);
-                            } else {
-                                // Below us
-                                ui.painter().hline(rect.x_range(), rect.bottom(), stroke);
-                            }
-                        }
-                    }
-
-                    // Dropped on the row, but not on any one chip:
-                    if let Some(dragged_payload) = bar_drop {
-                        match *dragged_payload {
-                            DragPayload::Chip(from_loc) => {
-                                chip_from = Some(from_loc);
-                                chip_to = Some(ChipLocation {
-                                    row: row_idx,
-                                    chip: SHORTCUT_LAYOUT_END,
-                                });
-                            }
-                            DragPayload::Row(from_row) => {
-                                let y = ui
-                                    .input(|i| i.pointer.interact_pos())
-                                    .map_or(zone.response.rect.center().y, |p| p.y);
-                                row_from = Some(from_row);
-                                row_to = Some(if y < zone.response.rect.center().y {
-                                    row_idx
-                                } else {
-                                    row_idx + 1
-                                });
-                            }
-                        }
                     }
                 });
+        }
+        let f = flags.borrow();
+        if f.exit_rename {
+            let trimmed = name_buf.borrow().trim().to_string();
+            state.shortcut_groups[group_idx].name =
+                if trimmed.is_empty() { "未命名".to_string() } else { trimmed };
+            state.shortcut_renaming = None;
+            state.bump();
+        }
+        if f.start_rename {
+            state.shortcut_renaming = Some(group_idx);
+            state.shortcut_rename_focus = true;
+            state.bump();
+        }
+        if f.toggle_free_position {
+            state.shortcut_groups[group_idx].free_position =
+                !state.shortcut_groups[group_idx].free_position;
+            state.bump();
+        }
+        if f.add_row {
+            state.shortcut_groups[group_idx].rows.push(Vec::new());
+            state.bump();
+        }
+        if !f.delete_rows.is_empty() {
+            let mut idxs = f.delete_rows.clone();
+            idxs.sort_by(|a, b| b.cmp(a));
+            idxs.dedup();
+            for i in idxs {
+                if i < state.shortcut_groups[group_idx].rows.len() {
+                    let chips = std::mem::take(&mut state.shortcut_groups[group_idx].rows[i]);
+                    state.shortcut_groups[group_idx].rows.remove(i);
+                    state.shortcut_trailing.extend(chips);
+                }
             }
+            state.bump();
+        }
+        if f.delete {
+            to_delete.push(group_idx);
+        }
+    }
+    if !to_delete.is_empty() {
+        state.shortcut_renaming = None;
+        for i in to_delete.into_iter().rev() {
+            let group = state.shortcut_groups.remove(i);
+            for row in group.rows {
+                for chip in row {
+                    state.shortcut_trailing.push(chip);
+                }
+            }
+        }
+        state.bump();
+    }
+    ui.add_space(8.0);
+    ui.label("候選區:");
+    let trailing = state.shortcut_trailing.clone();
+    bar_ui(
+        ui,
+        RowLocation {
+            group: SHORTCUT_END,
+            row: 0,
+        },
+        &trailing,
+        false,
+        &mut row_from,
+        &mut row_to,
+        &mut chip_from,
+        &mut chip_to,
+    );
+    if let (Some(from), Some(to)) = (chip_from, chip_to) {
+        move_chip(state, from, to);
+        state.bump();
+    }
+    if let (Some(from), Some(to)) = (row_from, row_to) {
+        move_row(state, from, to);
+        state.bump();
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn bar_ui(
+    ui: &mut egui::Ui,
+    row_loc: RowLocation,
+    chips: &[String],
+    allow_row_dnd: bool,
+    row_from: &mut Option<RowLocation>,
+    row_to: &mut Option<RowLocation>,
+    chip_from: &mut Option<ChipLocation>,
+    chip_to: &mut Option<ChipLocation>,
+) {
+    // The whole row (grip + items area) is a drop target as well,
+    // so dropping on the grip area snaps just like anywhere else.
+    let mut bar_rect = None;
+    let mut bar_drop_out = None;
+    let (whole, whole_drop) = ui.dnd_drop_zone::<DragPayload, ()>(Frame::new(), |ui| {
+        ui.horizontal(|ui| {
+            // Left grip: the vertical dnd drag handle (行程不開放拖曳).
+            if allow_row_dnd {
+                ui.dnd_drag_source(
+                    egui::Id::unique(("shortcut_layout_bar", row_loc.group, row_loc.row)),
+                    DragPayload::Row(row_loc),
+                    |ui| {
+                        ui.label("⠿").on_hover_text("拖曳整條上下排序");
+                    },
+                );
+            }
+            let (zone, bar_drop) = ui.dnd_drop_zone::<DragPayload, ()>(Frame::new(), |ui| {
+                ui.horizontal(|ui| {
+                    for (chip_idx, chip) in chips.iter().enumerate() {
+                        let chip_loc = ChipLocation {
+                            group: row_loc.group,
+                            row: row_loc.row,
+                            chip: chip_idx,
+                        };
+                        let chip_id = egui::Id::unique(("shortcut_layout_chip", row_loc.group, row_loc.row, chip_idx));
+                        let chip_response = ui
+                            .dnd_drag_source(chip_id, DragPayload::Chip(chip_loc), |ui| {
+                                ui.label(chip);
+                            })
+                            .response;
+                        let rect = chip_response.rect;
+                        let pointer = ui.input(|i| i.pointer.interact_pos());
+                        let insert_chip_idx = if pointer.is_some_and(|p| p.x < rect.center().x) {
+                            chip_idx
+                        } else {
+                            chip_idx + 1
+                        };
+                        // Preview insertion:
+                        if let (Some(pointer), Some(hovered_payload)) = (
+                            pointer,
+                            chip_response.dnd_hover_payload::<DragPayload>(),
+                        ) {
+                            if let DragPayload::Chip(hovered_loc) = *hovered_payload {
+                                let stroke = insertion_stroke(ui, 1.0);
+                                if hovered_loc == chip_loc {
+                                    ui.painter().vline(rect.center().x, rect.y_range(), stroke);
+                                } else if pointer.x < rect.center().x {
+                                    ui.painter().vline(rect.left(), rect.y_range(), stroke);
+                                } else {
+                                    ui.painter().vline(rect.right(), rect.y_range(), stroke);
+                                }
+                            }
+                        }
+                        // Detect drops onto this chip:
+                        if let (Some(pointer), Some(dragged_payload)) =
+                            (pointer, chip_response.dnd_release_payload())
+                        {
+                            match *dragged_payload {
+                                DragPayload::Chip(from_loc) => {
+                                    *chip_from = Some(from_loc);
+                                    *chip_to = Some(ChipLocation {
+                                        group: row_loc.group,
+                                        row: row_loc.row,
+                                        chip: insert_chip_idx,
+                                    });
+                                }
+                                DragPayload::Row(from_loc) => {
+                                    if allow_row_dnd {
+                                        *row_from = Some(from_loc);
+                                        *row_to = Some(RowLocation {
+                                            group: row_loc.group,
+                                            row: if pointer.y < rect.center().y {
+                                                row_loc.row
+                                            } else {
+                                                row_loc.row + 1
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // 空列: 一個斜體提示兼拖放熱區, 沒項目時也可往裡放回項目
+                    if chips.is_empty() {
+                        ui.label(
+                            RichText::new("無內容")
+                                .italics()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                });
+            });
+            bar_rect = Some(zone.response.rect);
+            bar_drop_out = bar_drop;
         });
     });
-
-    if let Some(dragged_payload) = empty_drop {
-        match *dragged_payload {
-            DragPayload::Row(from_row) => {
-                // Dropped onto empty space, but not on any row.
-                row_from = Some(from_row);
-                row_to = Some(SHORTCUT_LAYOUT_END);
-            }
-            DragPayload::Chip(from_loc) => {
-                chip_from = Some(from_loc);
-                chip_to = Some(ChipLocation {
-                    row: SHORTCUT_LAYOUT_END,
-                    chip: SHORTCUT_LAYOUT_END,
-                });
+    let whole_rect = whole.response.rect;
+    // Row-level preview: a horizontal line above/below the row.
+    if allow_row_dnd {
+        if let (Some(pointer), Some(hovered_payload)) = (
+            ui.input(|i| i.pointer.interact_pos()),
+            whole.response.dnd_hover_payload::<DragPayload>(),
+        ) {
+            if let DragPayload::Row(hovered_row) = *hovered_payload {
+                let rect = whole_rect;
+                let stroke = insertion_stroke(ui, 2.0);
+                if hovered_row == row_loc {
+                    ui.painter().hline(rect.x_range(), rect.center().y, stroke);
+                } else if pointer.y < rect.center().y {
+                    ui.painter().hline(rect.x_range(), rect.top(), stroke);
+                } else {
+                    ui.painter().hline(rect.x_range(), rect.bottom(), stroke);
+                }
             }
         }
     }
-
-    if let (Some(from), Some(to)) = (chip_from, chip_to) {
-        actions.push(UiAction::ShortcutLayoutMoveChip { from, to });
-    }
-
-    if let (Some(from), Some(to)) = (row_from, row_to) {
-        actions.push(UiAction::ShortcutLayoutMoveRow { from, to });
+    // Dropped on the row, but not on any one chip.
+    let from_bar = bar_drop_out.is_some();
+    if let Some(dragged_payload) = bar_drop_out.or(whole_drop) {
+        match *dragged_payload {
+            DragPayload::Chip(from_loc) => {
+                *chip_from = Some(from_loc);
+                *chip_to = Some(ChipLocation {
+                    group: row_loc.group,
+                    row: row_loc.row,
+                    chip: SHORTCUT_END,
+                });
+            }
+            DragPayload::Row(from_loc) => {
+                if allow_row_dnd {
+                    let rect = if from_bar { bar_rect.unwrap_or(whole_rect) } else { whole_rect };
+                    let y = ui
+                        .input(|i| i.pointer.interact_pos())
+                        .map_or(rect.center().y, |p| p.y);
+                    *row_from = Some(from_loc);
+                    *row_to = Some(RowLocation {
+                        group: row_loc.group,
+                        row: if y < rect.center().y {
+                            row_loc.row
+                        } else {
+                            row_loc.row + 1
+                        },
+                    });
+                }
+            }
+        }
     }
 }
-
-fn draw_settings(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
+fn draw_settings(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<UiAction>) {
     egui::CollapsingHeader::new("介面")
         .default_open(true)
         .show(ui, |ui| {
@@ -3244,21 +3756,7 @@ fn draw_settings(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction
     egui::CollapsingHeader::new("捷徑")
         .default_open(true)
         .show(ui, |ui| {
-            settings_row(ui, "截圖", |ui| {
-                let mut enabled = state.shortcut_screenshot;
-                if ui.checkbox(&mut enabled, "").changed() {
-                    actions.push(UiAction::SetShortcutEnabled(Shortcut::Screenshot, enabled));
-                }
-            });
-            settings_row(ui, "終端台", |ui| {
-                let mut enabled = state.shortcut_console;
-                if ui.checkbox(&mut enabled, "").changed() {
-                    actions.push(UiAction::SetShortcutEnabled(Shortcut::Console, enabled));
-                }
-            });
-            settings_row(ui, "佈局", |ui| {
-                draw_shortcut_layout(ui, state, actions);
-            });
+            draw_shortcut_layout(ui, state, actions);
         });
 
     egui::CollapsingHeader::new("掃描結果")
@@ -3279,6 +3777,25 @@ fn draw_settings(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction
                 }
             });
         });
+
+    egui::CollapsingHeader::new("Hex Dump")
+        .default_open(true)
+        .show(ui, |ui| {
+            settings_row(ui, "重新整理間隙", |ui| {
+                let mut secs = state.hex_refresh_interval;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut secs)
+                            .speed(0.1)
+                            .range(0.1..=10.0)
+                            .suffix("s"),
+                    )
+                    .changed()
+                {
+                    actions.push(UiAction::SetHexRefreshInterval(secs));
+                }
+            });
+        });
 }
 
 fn settings_row(ui: &mut egui::Ui, label: &str, add_value: impl FnOnce(&mut egui::Ui)) {
@@ -3288,16 +3805,18 @@ fn settings_row(ui: &mut egui::Ui, label: &str, add_value: impl FnOnce(&mut egui
     });
 }
 
-fn draw_bottom_bar(ui: &mut egui::Ui, state: &AppState) {
+fn draw_bottom_bar(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
     let mut items: Vec<String> = Vec::new();
     if state.pid > 0 {
         items.push(format!("行程: {} | PID: {}", state.proc_name, state.pid));
     } else {
         items.push("行程: - | PID: -".to_string());
     }
-    if state.module_base != 0 {
+    // 點擊基底位址複製到應用內剪切板; 其他 item 保持 hover-only
+    let copy_idx = (state.module_base != 0).then(|| {
         items.push(format!("基底位址: 0x{:x}", state.module_base));
-    }
+        items.len() - 1
+    });
     if !state.maps.is_empty() {
         let (virtual_span, selected_count) = selected_map_totals(state);
         items.push(format!(
@@ -3319,8 +3838,17 @@ fn draw_bottom_bar(ui: &mut egui::Ui, state: &AppState) {
     }
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        for item in &items {
-            ui.add(Button::new(RichText::new(item)).sense(egui::Sense::hover()));
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                ui.separator();
+            }
+            if Some(i) == copy_idx {
+                if ui.add(egui::Label::new(item).sense(egui::Sense::click())).clicked() {
+                    actions.push(UiAction::CopyText(format!("0x{:x}", state.module_base)));
+                }
+            } else {
+                ui.add(egui::Label::new(item));
+            }
         }
     });
 }

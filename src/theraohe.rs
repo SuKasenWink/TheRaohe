@@ -15,7 +15,6 @@ mod nb9;
 mod screenshot;
 mod sf_keys;
 mod sf_touch;
-mod touch_targets;
 mod ui;
 
 #[repr(C, align(16))]
@@ -280,6 +279,26 @@ impl FrameCtx<'_> {
             crate::lua_env::set_target_info(state.pid, state.module_base);
             for script in &mut state.lua_scripts {
                 crate::lua_env::call_tick(script);
+            }
+            // 按住的捷徑 Lua 函式: 每幀(=Tick)積極按壓都呼叫一次, 前端不區分點擊/積極按壓
+            let held = std::mem::take(&mut state.shortcut_held);
+            if !held.is_empty() {
+                let mut seen = std::collections::HashSet::with_capacity(held.len());
+                for label in held {
+                    if let Some((stem, function)) = ui::parse_shortcut_label(&label) {
+                        if !seen.insert((stem.clone(), function.clone())) {
+                            continue;
+                        }
+                        let file = format!("{stem}.lua");
+                        if let Some(s) = state
+                            .lua_scripts
+                            .iter_mut()
+                            .find(|s| s.file_name == file)
+                        {
+                            crate::lua_env::call(s, &function);
+                        }
+                    }
+                }
             }
             ui::apply_lua_cmds(&mut state);
         }
@@ -641,8 +660,6 @@ unsafe fn run(args: &Args) {
             args.keys
         );
     }
-
-    touch_targets::set_layer_offset(args.x, args.y);
 
     if args.touch {
         sf_touch::start(

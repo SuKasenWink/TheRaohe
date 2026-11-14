@@ -172,3 +172,21 @@ const DWORD SynData = 0x828;
 const DWORD NetAvatarData = 0x440;
 const DWORD ServerZoneId = 0x994;
 ```
+
+有了
+沒有按鈕概念
+只有公開函式概念
+所有公開函式
+自動反射成捷徑
+
+每次Tick 檢查捷徑有沒有被按住 按住就調用那個Lua函式
+
+這需要動的部分比較多
+首先
+設置 捷徑
+把"佈局"小標題字樣刪掉
+
+整個結構改成
+窗口:
+  佈局
+    水平列Array

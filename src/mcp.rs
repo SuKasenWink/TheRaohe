@@ -1,7 +1,6 @@
 //! MCP server (Streamable HTTP): 讓 agent 可直連進程驅動動作
 //! 僅本機直連 (127.0.0.1), 無認證; Streamable HTTP 以 application/json 回應
 //! 工具: screenshot / status / procs / attach / scan / refine / results / selection / read
-//!       / touch_target_add / touch_target_remove / touch_target_list / touch_target_press
 //! 可選外掛: 依賴方向 mcp -> ui (UiAction 事件流), ui 對本模組一無所知
 //! 寫操作一律走 ui::apply_actions 與 GUI 同一條派發路徑, MCP 只產出事件 + 唯讀觀察
 
@@ -59,20 +58,6 @@ struct RefineParams {
     mode: String,
     /// increased_by / decreased_by / exact_value 必填
     value: Option<String>,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-struct TouchNameParams {
-    /// 觸控目標名稱
-    name: String,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-struct TouchPressParams {
-    /// 觸控目標名稱
-    name: String,
-    /// 按住時長 (毫秒), 預設 60, 上限 2000
-    duration_ms: Option<u64>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -474,62 +459,6 @@ impl Theraohe {
             state.bump();
         }
         Ok(out)
-    }
-
-    #[tool(
-        description = "新增可命名的觸控目標 (主題色十字窗口, 可拖動, 只能由 MCP 刪除); 名稱重複會被拒絕"
-    )]
-    async fn touch_target_add(
-        &self,
-        Parameters(p): Parameters<TouchNameParams>,
-    ) -> Result<String, ErrorData> {
-        let mut state = self.lock()?;
-        match crate::touch_targets::add(&mut state, &p.name) {
-            Ok((x, y)) => Ok(format!(
-                "已新增觸控目標 {} (點座標 {:.0}, {:.0}; 下次渲染時出現, 用戶可拖動定位)",
-                p.name.trim(),
-                x,
-                y
-            )),
-            Err(e) => Err(ErrorData::invalid_params(e, None)),
-        }
-    }
-
-    #[tool(description = "刪除指定的觸控目標; 目標只能由 MCP 刪除")]
-    async fn touch_target_remove(
-        &self,
-        Parameters(p): Parameters<TouchNameParams>,
-    ) -> Result<String, ErrorData> {
-        let mut state = self.lock()?;
-        if crate::touch_targets::remove(&mut state, p.name.trim()) {
-            Ok(format!("已刪除 {}", p.name.trim()))
-        } else {
-            Err(ErrorData::invalid_params(
-                format!("找不到名為 {} 的觸控目標", p.name.trim()),
-                None,
-            ))
-        }
-    }
-
-    #[tool(description = "列出目前所有觸控目標及其座標")]
-    async fn touch_target_list(&self) -> Result<String, ErrorData> {
-        let state = self.lock()?;
-        Ok(crate::touch_targets::list(&state))
-    }
-
-    #[tool(
-        description = "在指定觸控目標的當前位置按下再抬起; 走 nb9 虛擬觸控; duration_ms 預設 60, 上限 2000"
-    )]
-    async fn touch_target_press(
-        &self,
-        Parameters(p): Parameters<TouchPressParams>,
-    ) -> Result<String, ErrorData> {
-        let hold_ms = p.duration_ms.unwrap_or(60).min(2000);
-        let state = self.lock()?;
-        let name = p.name.trim();
-        crate::touch_targets::press(&state, name, std::time::Duration::from_millis(hold_ms))
-            .map_err(|e| ErrorData::internal_error(e, None))?;
-        Ok(format!("已在 {name} 按下 ({hold_ms} ms)"))
     }
 
     #[tool(description = "列出目前人類在結果頁選中的行 (含是否自選中後變更)")]
