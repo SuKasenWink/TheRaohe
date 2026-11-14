@@ -1,3 +1,4 @@
+# Package zip following gitignore
 $ErrorActionPreference = "Stop"
 
 function Get-EscapedClassChar {

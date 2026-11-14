@@ -1,5 +1,7 @@
 ﻿use crate::keyboard::Keyboard;
-use crate::mem::{self, ChangeMode, MapRegion, ProcInfo, ResultEntry, ValueType};
+use crate::lua_env;
+use crate::maps::{self, MapRegion};
+use crate::mem::{self, ChangeMode, ProcInfo, ResultEntry, ValueType};
 use egui::{
     vec2, Align, Button, CollapsingHeader, Color32,     FontData, FontDefinitions, FontFamily,
     FontTweak, Frame, Layout, RadioButton, RichText, ScrollArea, TextWrapMode,
@@ -13,6 +15,38 @@ use std::time::Instant;
 
 // 純黑背景 (AMOLED); 按鈕/控制項的預設樣式原封不動, 只有底色改黑
 const HEX_LEN: usize = 4096;
+
+/// Sentinel used as a drop index: append at the very end.
+const SHORTCUT_LAYOUT_END: usize = usize::MAX;
+
+/// Location of an item inside a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChipLocation {
+    pub row: usize,
+    pub chip: usize,
+}
+
+/// Unified payload for the vertical (row) and horizontal (chip) dnd,
+/// so a payload that reaches the "wrong" handler is never silently discarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragPayload {
+    /// A whole row — the vertical dnd.
+    Row(usize),
+    /// An item inside a row — the horizontal dnd.
+    Chip(ChipLocation),
+}
+
+// 佈局示意的佔位資料, 尚未對應真實捷徑
+fn default_shortcut_layout() -> Vec<Vec<String>> {
+    [
+        vec!["捷徑 1", "捷徑 2", "捷徑 3", "捷徑 4"],
+        vec!["捷徑 5", "捷徑 6", "捷徑 7"],
+        vec!["捷徑 8", "捷徑 9", "捷徑 10", "捷徑 11"],
+    ]
+    .into_iter()
+    .map(|row| row.into_iter().map(str::to_owned).collect())
+    .collect()
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -42,32 +76,37 @@ impl Tab {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Shortcut {
     Screenshot,
+    Console,
 }
 
 impl Shortcut {
-    pub const ALL: [Shortcut; 1] = [Shortcut::Screenshot];
+    pub const ALL: [Shortcut; 2] = [Shortcut::Screenshot, Shortcut::Console];
 
     fn label(self) -> &'static str {
         match self {
             Shortcut::Screenshot => "截圖",
+            Shortcut::Console => "終端台",
         }
     }
 
     fn enabled(self, state: &AppState) -> bool {
         match self {
             Shortcut::Screenshot => state.shortcut_screenshot,
+            Shortcut::Console => state.shortcut_console,
         }
     }
 
     fn set_enabled(self, state: &mut AppState, value: bool) {
         match self {
             Shortcut::Screenshot => state.shortcut_screenshot = value,
+            Shortcut::Console => state.shortcut_console = value,
         }
     }
 
     fn action(self) -> UiAction {
         match self {
             Shortcut::Screenshot => UiAction::CaptureScreenshot,
+            Shortcut::Console => UiAction::ToggleConsole,
         }
     }
 }
@@ -83,6 +122,7 @@ pub enum TypeSlot {
     U8,
     Ptr,
     S16,
+    Range,
 }
 
 impl TypeSlot {
@@ -97,7 +137,7 @@ impl TypeSlot {
         TypeSlot::Ptr,
     ];
 
-    pub const ADVANCED: [TypeSlot; 1] = [TypeSlot::S16];
+    pub const ADVANCED: [TypeSlot; 2] = [TypeSlot::S16, TypeSlot::Range];
 
     pub fn ty(self, signed: bool) -> ValueType {
         match self {
@@ -124,6 +164,7 @@ impl TypeSlot {
             }
             TypeSlot::F32 => ValueType::Float32,
             TypeSlot::F64 => ValueType::Double,
+            TypeSlot::Range => ValueType::Range,
             TypeSlot::Bool => ValueType::Bool,
             TypeSlot::Bit => ValueType::BoolBit,
             TypeSlot::U8 => ValueType::UInt8,
@@ -156,12 +197,176 @@ impl TypeSlot {
             }
             TypeSlot::F32 => "f32",
             TypeSlot::F64 => "f64(Double)",
+            TypeSlot::Range => "256B",
             TypeSlot::Bool => "bool",
             TypeSlot::Bit => "Bit(Bitfield bool)",
             TypeSlot::U8 => "u8/enum",
             TypeSlot::Ptr => "Ptr",
         }
     }
+
+    pub fn is_interval(self) -> bool {
+        matches!(self, TypeSlot::Range)
+    }
+
+    pub fn interval_block_bytes(self) -> Option<u64> {
+        match self {
+            TypeSlot::Range => Some(256),
+            _ => None,
+        }
+    }
+}
+
+const FUZZY_SCAN_BUFFER: u64 = 1 << 20;
+const FUZZY_RECORD_BYTES: u64 = 16;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StructViewKind {
+    None,
+    Vector3,
+    Rotator,
+}
+
+impl StructViewKind {
+    const ALL: [StructViewKind; 3] = [
+        StructViewKind::None,
+        StructViewKind::Vector3,
+        StructViewKind::Rotator,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            StructViewKind::None => "None",
+            StructViewKind::Vector3 => "Vector(3)",
+            StructViewKind::Rotator => "Rotator",
+        }
+    }
+
+    fn axis_labels(self) -> [&'static str; 3] {
+        match self {
+            StructViewKind::None | StructViewKind::Vector3 => ["X", "Y", "Z"],
+            StructViewKind::Rotator => ["Pitch", "Yaw", "Roll"],
+        }
+    }
+
+    fn axis_prefixes(self) -> [&'static str; 3] {
+        match self {
+            StructViewKind::None | StructViewKind::Vector3 => ["X", "Y", "Z"],
+            StructViewKind::Rotator => ["P", "Y", "R"],
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ResultsSource {
+    Empty,
+    Typed,
+    BlockConverted,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Authority {
+    Typed,
+    Block,
+}
+
+impl Authority {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Authority::Typed => "常規",
+            Authority::Block => "分塊",
+        }
+    }
+}
+
+// 常規/分塊兩種結果合一; 權威源標記誰是不可替代的資料源
+// 權威源僅在掃描/篩選時翻轉; 常規與分塊的互轉只是投影, 不翻轉權威源,
+// epoch 決定目標側快取是否仍新鮮, 反覆切換不搬移資料
+pub(crate) struct ScanResults {
+    pub authority: Authority,
+    pub typed: Vec<ResultEntry>,
+    pub blocks: Option<mem::FuzzyBase>,
+    pub(crate) data_epoch: u64,
+    pub(crate) typed_epoch: u64,
+    pub(crate) blocks_epoch: u64,
+}
+
+impl ScanResults {
+    fn new() -> Self {
+        Self {
+            authority: Authority::Typed,
+            typed: Vec::new(),
+            blocks: None,
+            data_epoch: 1,
+            typed_epoch: 1,
+            blocks_epoch: 1,
+        }
+    }
+
+    // 權威側被掃描/篩選/清空寫入: 翻轉權威源並使投影快取失效
+    fn replace_typed(&mut self, entries: Vec<ResultEntry>) {
+        self.typed = entries;
+        self.authority = Authority::Typed;
+        self.data_epoch += 1;
+        self.typed_epoch = self.data_epoch;
+    }
+
+    fn replace_blocks(&mut self, base: Option<mem::FuzzyBase>) {
+        self.blocks = base;
+        self.authority = Authority::Block;
+        self.data_epoch += 1;
+        self.blocks_epoch = self.data_epoch;
+    }
+
+    fn clear(&mut self) {
+        self.typed.clear();
+        self.blocks = None;
+        self.authority = Authority::Typed;
+        self.data_epoch += 1;
+        self.typed_epoch = self.data_epoch;
+        self.blocks_epoch = self.data_epoch;
+    }
+
+    // 目標=分塊: 快取失效時從 typed 重新推導對齊視圖
+    fn ensure_blocks(&mut self, pid: i32, maps: &[MapRegion], block_bytes: u64) {
+        if self.blocks_epoch == self.data_epoch {
+            return;
+        }
+        self.blocks = if self.typed.is_empty() {
+            None
+        } else {
+            Some(mem::blocks_from_entries(pid, maps, &self.typed, block_bytes))
+        };
+        self.blocks_epoch = self.data_epoch;
+    }
+
+    // 目標=常規: 快取失效時從 blocks 展開
+    // Ok(true) = 本次展開(新資料, 呼叫端需更新 results_epoch 等); Ok(false) = 快取新鮮
+    // Err(()) = 權威為分塊但 blocks 已告罄, 無可顯示
+    fn ensure_typed(&mut self, pid: i32, ty: ValueType) -> Result<bool, ()> {
+        if self.typed_epoch == self.data_epoch {
+            return Ok(false);
+        }
+        match &self.blocks {
+            Some(_) => {
+                let base = self.blocks.as_ref().expect("checked above");
+                let (entries, _) = mem::fuzzy_to_entries(pid, base, ty);
+                self.typed = entries;
+                self.typed_epoch = self.data_epoch;
+                Ok(true)
+            }
+            None => Err(()),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct StructWindow {
+    pub ty: ValueType,
+    pub anchor: usize,
+    pub epoch: u64,
+    pub values: [Option<u64>; 3],
+    at: Instant,
 }
 
 pub struct AppState {
@@ -172,6 +377,7 @@ pub struct AppState {
     pub pid: i32,
     pub proc_name: String,
     pub module_base: u64,
+    pub last_scan_bytes: Option<u64>,
     pub procs: Vec<ProcInfo>,
     pub maps: Vec<MapRegion>,
     pub map_checked: Vec<bool>,
@@ -182,13 +388,22 @@ pub struct AppState {
     pub input: String,
     pub proc_query: String,
     pub show_system: bool,
-    pub results: Vec<ResultEntry>,
+    pub(crate) scan: ScanResults,
     // 結果集世代: 每次清空/整体替換 +1, 靜默刷新用它判斷自己手裡的副本是不是陳的
     pub(crate) results_epoch: u64,
-    // 位址 -> 選中時的原始值, refresh 後比對即得「自選中後變更」
-    pub selected: HashMap<u64, u64>,
-    // agent 正在看的位址: 最後一次 results 請求起累加, 結果替換時清空
-    pub(crate) agent_view: HashSet<u64>,
+    pub(crate) results_source: ResultsSource,
+    // 選中的位址 (Agent 瀏覽 results 與人類點選共用), 結果被清空/替換時重置
+    pub selected: HashSet<u64>,
+    // 預覽輪詢到的最新值 (display-only); results 本體不可變, 兩者差即「自上次掃描後變更」
+    pub(crate) live_bits: HashMap<u64, u64>,
+    pub struct_view_kind: StructViewKind,
+    pub struct_anchor: usize,
+    pub struct_open: bool,
+    pub(crate) struct_cache: HashMap<u64, StructWindow>,
+    pub(crate) struct_pending: HashMap<u64, u64>,
+    pub(crate) struct_epoch: u64,
+    pub range_min: String,
+    pub range_max: String,
     pub scanning: bool,
     pub hex_addr: u64,
     pub hex: Vec<u8>,
@@ -199,12 +414,20 @@ pub struct AppState {
     pub cond_open: bool,
     pub refresh_interval: f32,
     pub shortcut_screenshot: bool,
+    pub shortcut_console: bool,
+    pub console_open: bool,
+    /// 每腳本一個獨立 Lua 狀態; 載入時與每次呼叫/寫回後重算反射
+    pub lua_scripts: Vec<lua_env::LuaScript>,
+    // 捷徑區目前僅作拖放佈局示意, 不對應懸浮窗, 亦不持久化
+    pub shortcut_layout: Vec<Vec<String>>,
     pub screenshot_pending: bool,
     pub screenshot_result: Option<Result<String, String>>,
     pub close_confirm_open: bool,
     pub collapse_toggle: std::sync::atomic::AtomicBool,
     /// 狀態欄像素高度 (開機時讀一次；熱旋轉不更新)
     pub status_bar_h: i32,
+    pub touch_targets: Vec<crate::touch_targets::TouchTarget>,
+    pub ppp: f32,
 }
 
 impl AppState {
@@ -217,7 +440,7 @@ impl AppState {
         } else {
             "核心驅動未連線：ioctl 618 失敗".to_string()
         };
-        Self {
+        let mut state = Self {
             visible: show,
             revision: 1,
             driver_ok,
@@ -225,6 +448,7 @@ impl AppState {
             pid: 0,
             proc_name: String::new(),
             module_base: 0,
+            last_scan_bytes: None,
             procs,
             maps: Vec::new(),
             map_checked: Vec::new(),
@@ -235,10 +459,19 @@ impl AppState {
             input: String::new(),
             proc_query: String::new(),
             show_system: false,
-            results: Vec::new(),
+            scan: ScanResults::new(),
             results_epoch: 1,
-            selected: HashMap::new(),
-            agent_view: HashSet::new(),
+            results_source: ResultsSource::Empty,
+            selected: HashSet::new(),
+            live_bits: HashMap::new(),
+            struct_view_kind: StructViewKind::None,
+            struct_anchor: 0,
+            struct_open: true,
+            struct_cache: HashMap::new(),
+            struct_pending: HashMap::new(),
+            struct_epoch: 1,
+            range_min: String::new(),
+            range_max: String::new(),
             scanning: false,
             hex_addr: 0,
             hex: Vec::new(),
@@ -249,12 +482,41 @@ impl AppState {
             cond_open: true,
             refresh_interval: 1.0,
             shortcut_screenshot: true,
+            shortcut_console: true,
+            console_open: false,
+            lua_scripts: lua_env::load_all(),
+            shortcut_layout: default_shortcut_layout(),
             screenshot_pending: false,
             screenshot_result: None,
             close_confirm_open: std::env::var_os("THERAOHE_DBG_CLOSE").is_some(),
             collapse_toggle: std::sync::atomic::AtomicBool::new(false),
             status_bar_h,
+            touch_targets: Vec::new(),
+            ppp: 2.0,
+        };
+        // 此時 egui 宿主已建立、行程表已掃描完: 自動呼叫各腳本 init(), 再排空 Lua 發出的命令
+        lua_env::set_target_info(0, 0);
+        lua_env::set_module_index(&state.maps);
+        for script in &mut state.lua_scripts {
+            lua_env::call_init(script);
         }
+        apply_lua_cmds(&mut state);
+        state
+    }
+
+    fn reset_struct_view(&mut self) {
+        self.struct_cache.clear();
+        self.struct_pending.clear();
+        self.struct_epoch = self.struct_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn clear_results(&mut self) {
+        self.scan.clear();
+        self.results_epoch += 1;
+        self.selected.clear();
+        self.live_bits.clear();
+        self.reset_struct_view();
+        self.results_source = ResultsSource::Empty;
     }
 
     pub(crate) fn bump(&mut self) {
@@ -276,13 +538,12 @@ impl AppState {
             .unwrap_or_else(|| format!("pid {pid}"));
         self.pid = pid;
         self.proc_name = name;
-        self.maps = mem::read_maps(pid);
-        self.map_checked = self.maps.iter().map(is_scannable).collect();
-        self.module_base = mem::main_module(&self.maps);
-        self.results.clear();
-        self.results_epoch += 1;
-        self.selected.clear();
-        self.agent_view.clear();
+        self.maps = maps::read_maps(pid);
+        lua_env::set_module_index(&self.maps);
+        self.map_checked = self.maps.iter().map(maps::default_map_checked).collect();
+        self.module_base = maps::main_module(&self.maps);
+        self.last_scan_bytes = None;
+        self.clear_results();
         self.input.clear();
         self.tab = Tab::Maps;
         if self.maps.is_empty() {
@@ -306,23 +567,97 @@ impl AppState {
     }
 
     fn select_slot(&mut self, slot: TypeSlot) {
+        if self.scan_slot == slot {
+            return;
+        }
+        if slot.is_interval() {
+            // 目標=分塊: 快取失效(權威源被掃描/篩選動過)才重推導; 常規側原封不動
+            let block_bytes = slot.interval_block_bytes().expect("slot is interval");
+            self.scan.ensure_blocks(self.pid, &self.maps, block_bytes);
+            self.scan_slot = slot;
+            self.bump();
+            return;
+        }
+        let target_family_changed = self.scan_slot.is_interval();
+        if target_family_changed {
+            // 目標=常規, 源=分塊: 快取失效時展開; 權威為分塊但 blocks 告罄則清空
+            match self.scan.ensure_typed(self.pid, slot.ty(self.signed)) {
+                Ok(true) => {
+                    // 分塊權威展開的是新資料: 整批替換常規側, 源篩選結果不丟
+                    self.results_source = ResultsSource::BlockConverted;
+                    self.results_epoch += 1;
+                    self.selected.clear();
+                    self.live_bits.clear();
+                    self.reset_struct_view();
+                    self.input.clear();
+                }
+                Ok(false) => {}
+                Err(()) => {
+                    // 分塊權威下 blocks 已被篩光: 常規側無可顯示
+                    self.scan.typed.clear();
+                    self.scan.typed_epoch = self.scan.data_epoch;
+                    self.results_source = ResultsSource::Empty;
+                    self.results_epoch += 1;
+                    self.selected.clear();
+                    self.live_bits.clear();
+                    self.reset_struct_view();
+                }
+            }
+            self.scan_slot = slot;
+            self.bump();
+            return;
+        }
+        // 跨入 Bit: 每位元一行; 跨出 Bit: 同位址多行併一
+        if matches!(slot, TypeSlot::Bit) != matches!(self.scan_slot, TypeSlot::Bit) {
+            let ty = slot.ty(self.signed);
+            self.refit_bits(ty);
+        }
         self.scan_slot = slot;
-        self.results.clear();
-        self.results_epoch += 1;
-        self.selected.clear();
-        self.agent_view.clear();
-        self.input.clear();
-        self.status = format!("掃描類型：{}", slot.label(self.signed));
         self.bump();
+    }
+
+    /// 跨 Bit 邊界後舊結果語意不可沿用: 依位址重讀, 跨入展開為每位元一行,
+    /// 跨出同位址多行併一, 已篩出的候選集合保留
+    fn refit_bits(&mut self, ty: ValueType) {
+        let pid = self.pid;
+        let mut addrs: Vec<u64> = self.scan.typed.iter().map(|e| e.addr).collect();
+        addrs.sort_unstable();
+        addrs.dedup();
+        let mut out = Vec::with_capacity(addrs.len());
+        if ty == ValueType::BoolBit {
+            for addr in addrs {
+                if let Some(v) = crate::nb9::read_value(pid, addr, 1) {
+                    for k in 0..8u8 {
+                        out.push(ResultEntry {
+                            addr,
+                            bits: (v >> k) & 1,
+                            bit: k,
+                        });
+                    }
+                }
+            }
+        } else {
+            for addr in addrs {
+                if let Some(v) = crate::nb9::read_value(pid, addr, ty.size()) {
+                    out.push(ResultEntry {
+                        addr,
+                        bits: v,
+                        bit: 0,
+                    });
+                }
+            }
+        }
+        self.scan.typed = out;
+        self.selected.clear();
+        self.live_bits.clear();
+        self.results_epoch += 1;
+        self.results_source = ResultsSource::Typed;
+        self.reset_struct_view();
     }
 
     fn set_signed(&mut self, signed: bool) {
         self.signed = signed;
-        self.results.clear();
-        self.results_epoch += 1;
-        self.selected.clear();
-        self.agent_view.clear();
-        self.status = format!("掃描類型：{}", self.scan_slot.label(signed));
+        self.clear_results();
         self.bump();
     }
 
@@ -347,6 +682,14 @@ impl AppState {
     }
 
     fn toggle_map(&mut self, idx: usize) {
+        if self
+            .maps
+            .get(idx)
+            .map(maps::is_absolute_excluded)
+            .unwrap_or(true)
+        {
+            return;
+        }
         if let Some(v) = self.map_checked.get_mut(idx) {
             *v = !*v;
             self.bump();
@@ -372,12 +715,12 @@ impl AppState {
     }
 
     fn toggle_result(&mut self, index: usize) {
-        let Some(entry) = self.results.get(index) else {
+        let Some(entry) = self.scan.typed.get(index) else {
             return;
         };
-        let addr = entry.addr;
-        if self.selected.remove(&addr).is_none() {
-            self.selected.insert(addr, entry.bits);
+        let key = crate::mem::entry_key(entry.addr, entry.bit);
+        if !self.selected.remove(&key) {
+            self.selected.insert(key);
         }
         self.status = format!("已選中 {} 項", self.selected.len());
         self.bump();
@@ -459,27 +802,125 @@ pub(crate) enum UiAction {
     SetShowSystem(bool),
     SetRefreshInterval(f32),
     SetShortcutEnabled(Shortcut, bool),
+    ShortcutLayoutMoveRow { from: usize, to: usize },
+    ShortcutLayoutMoveChip { from: ChipLocation, to: ChipLocation },
     CaptureScreenshot,
+    ToggleConsole,
     ToggleAdvanced,
     ToggleTypeOpen,
     ToggleCondOpen,
     StartScan,
     StartRefine,
     ToggleResultSelect(usize),
+    SetStructViewKind(StructViewKind),
+    SetStructAnchor(usize),
+    ToggleStructOpen,
+    SetRangeMin(String),
+    SetRangeMax(String),
+    PrefetchStructWindows(Vec<u64>),
     RefreshHex,
     RequestClose,
     CancelClose,
     ConfirmClose,
 }
 
+// 索引越界時直接放棄本次移動, 佈局示意不值得為此 panic
+fn move_shortcut_layout_chip(layout: &mut [Vec<String>], from: ChipLocation, mut to: ChipLocation) {
+    if to.row == SHORTCUT_LAYOUT_END {
+        // Dropped on empty space: append at the end of the last row.
+        to.row = layout.len().saturating_sub(1);
+    }
+    if from.row >= layout.len() || to.row >= layout.len() {
+        return;
+    }
+    if from.chip >= layout[from.row].len() {
+        return;
+    }
+    if from.row == to.row {
+        // Adjust the chip index if we are re-ordering within the same row.
+        to.chip -= (from.chip < to.chip) as usize;
+    }
+    let chip = layout[from.row].remove(from.chip);
+    to.chip = to.chip.min(layout[to.row].len());
+    layout[to.row].insert(to.chip, chip);
+}
+
+fn move_shortcut_layout_row(layout: &mut Vec<Vec<String>>, from: usize, mut to: usize) {
+    if from >= layout.len() {
+        return;
+    }
+    if from < to {
+        // Dragging downwards: removing the row shifts the target down by one.
+        to -= 1;
+    }
+    let row = layout.remove(from);
+    to = to.min(layout.len());
+    layout.insert(to, row);
+}
+
+/// 排空 Lua 發出的命令並套用到 state; 與 apply_actions 同一個模式(鎖外收集、鎖內套用),
+/// init() 在 AppState::new 裡呼叫時走這裡, 按鈕觸發時 render() 每幀呼叫一次
+pub(crate) fn apply_lua_cmds(state: &mut AppState) {
+    for cmd in lua_env::drain_cmds() {
+        match cmd {
+            lua_env::LuaCmd::SelectPid(pid) => {
+                if state.procs.iter().any(|p| p.pid == pid) {
+                    state.attach(pid);
+                } else {
+                    state.status = format!("Lua: 找不到 pid {pid}");
+                    state.bump();
+                }
+            }
+            lua_env::LuaCmd::SelectName(name) => {
+                let found = state
+                    .procs
+                    .iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(&name))
+                    .or_else(|| {
+                        let needle = name.to_ascii_lowercase();
+                        state.procs.iter().find(|p| p.name.to_ascii_lowercase().contains(&needle))
+                    })
+                    .map(|p| p.pid);
+                match found {
+                    Some(pid) => state.attach(pid),
+                    None => {
+                        state.status = format!("Lua: 找不到行程 {name}");
+                        state.bump();
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
     match action {
         UiAction::StartScan => {
-            start_scan(app);
+            let interval = app
+                .lock()
+                .map(|state| state.scan_slot.is_interval())
+                .unwrap_or(false);
+            if interval {
+                start_fuzzy_scan(app);
+            } else {
+                start_scan(app);
+            }
             return;
         }
         UiAction::StartRefine => {
-            start_refine(app);
+            let interval = app
+                .lock()
+                .map(|state| state.scan_slot.is_interval())
+                .unwrap_or(false);
+            if interval {
+                start_fuzzy_refine(app);
+            } else {
+                start_refine(app);
+            }
+            return;
+        }
+        UiAction::PrefetchStructWindows(addrs) => {
+            prefetch_struct_windows(app, addrs);
             return;
         }
         _ => {}
@@ -522,6 +963,18 @@ pub(crate) fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
             shortcut.set_enabled(&mut state, enabled);
             state.bump();
         }
+        UiAction::ShortcutLayoutMoveRow { from, to } => {
+            move_shortcut_layout_row(&mut state.shortcut_layout, from, to);
+            state.bump();
+        }
+        UiAction::ShortcutLayoutMoveChip { from, to } => {
+            move_shortcut_layout_chip(&mut state.shortcut_layout, from, to);
+            state.bump();
+        }
+        UiAction::ToggleConsole => {
+            state.console_open = !state.console_open;
+            state.bump();
+        }
         UiAction::CaptureScreenshot => {
             state.screenshot_pending = true;
             state.bump();
@@ -530,28 +983,152 @@ pub(crate) fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
         UiAction::ToggleTypeOpen => state.toggle_type_open(),
         UiAction::ToggleCondOpen => state.toggle_cond_open(),
         UiAction::ToggleResultSelect(index) => state.toggle_result(index),
+        UiAction::SetStructViewKind(kind) => {
+            if state.struct_view_kind != kind {
+                state.struct_view_kind = kind;
+                state.bump();
+            }
+        }
+        UiAction::SetStructAnchor(anchor) => {
+            if anchor < 3 && state.struct_anchor != anchor {
+                state.struct_anchor = anchor;
+                state.reset_struct_view();
+                state.bump();
+            }
+        }
+        UiAction::ToggleStructOpen => {
+            state.struct_open = !state.struct_open;
+            state.bump();
+        }
+        UiAction::SetRangeMin(text) => {
+            state.range_min = text;
+            state.bump();
+        }
+        UiAction::SetRangeMax(text) => {
+            state.range_max = text;
+            state.bump();
+        }
         UiAction::RefreshHex => state.refresh_hex(),
         UiAction::RequestClose => state.set_close_confirm_open(true),
         UiAction::CancelClose => state.set_close_confirm_open(false),
         UiAction::ConfirmClose => {
             std::process::exit(0);
         }
-        UiAction::StartScan | UiAction::StartRefine => {}
+        UiAction::StartScan | UiAction::StartRefine | UiAction::PrefetchStructWindows(_) => {}
     }
 }
 
 fn selected_maps(state: &AppState) -> Vec<MapRegion> {
-    if state.map_checked.iter().any(|&v| v) {
-        state
-            .maps
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| state.map_checked.get(*i).copied().unwrap_or(false))
-            .map(|(_, m)| m.clone())
-            .collect()
-    } else {
-        state.maps.clone()
-    }
+    state
+        .maps
+        .iter()
+        .enumerate()
+        .filter(|(i, map)| {
+            state.map_checked.get(*i).copied().unwrap_or(false)
+                && !maps::is_absolute_excluded(map)
+        })
+        .map(|(_, m)| m.clone())
+        .collect()
+}
+
+fn start_fuzzy_scan(app: &Arc<Mutex<AppState>>) {
+    let job = {
+        let mut state = match app.lock() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if state.scanning {
+            return;
+        }
+        if state.pid <= 0 {
+            state.status = "尚未附加行程".to_string();
+            state.bump();
+            return;
+        }
+        if !state.scan_slot.is_interval() {
+            state.status = "區塊模式請先選 Advanced → 256B".to_string();
+            state.bump();
+            return;
+        }
+        if state.maps.is_empty() {
+            state.status = "沒有可掃描的映射".to_string();
+            state.bump();
+            return;
+        }
+        let selected = selected_maps(&state);
+        if selected.is_empty() {
+            state.status = "未選擇映射".to_string();
+            state.bump();
+            return;
+        }
+        let block_bytes = state
+            .scan_slot
+            .interval_block_bytes()
+            .expect("scan_slot is interval");
+        state.clear_results();
+        state.scanning = true;
+        state.status = "建立區塊快照...".to_string();
+        state.bump();
+        (state.pid, selected, block_bytes)
+    };
+    let app = Arc::clone(app);
+    std::thread::spawn(move || {
+        let base = mem::fuzzy_snapshot(job.0, &job.1, job.2);
+        if let Ok(mut state) = app.lock() {
+            state.scanning = false;
+            state.status.clear();
+            state.last_scan_bytes = Some(base.candidate_bytes);
+            state.scan.replace_blocks(Some(base));
+            state.bump();
+        }
+    });
+}
+
+fn start_fuzzy_refine(app: &Arc<Mutex<AppState>>) {
+    let job = {
+        let mut state = match app.lock() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if state.scanning {
+            return;
+        }
+        // 真快照或型別結果對齊出的分塊視圖, 精選縮窄視圖; 常規側原封不動
+        if state.scan.blocks.is_none() {
+            state.status = "尚無區塊快照，請先按建立區塊快照".to_string();
+            state.bump();
+            return;
+        }
+        if !matches!(
+            state.change_mode,
+            ChangeMode::AnyChange | ChangeMode::Unchanged
+        ) {
+            state.status = "區塊模式僅支援任意變化／原樣，已切換為任意變化".to_string();
+            state.change_mode = ChangeMode::AnyChange;
+            state.bump();
+        }
+        let base = state.scan.blocks.take().expect("blocks checked above");
+        state.scanning = true;
+        state.status = "篩選中…".to_string();
+        state.bump();
+        (state.pid, base, state.change_mode)
+    };
+    let app = Arc::clone(app);
+    std::thread::spawn(move || {
+        let outcome = mem::fuzzy_refine(job.0, job.1, job.2);
+        if let Ok(mut state) = app.lock() {
+            state.scanning = false;
+            state.status.clear();
+            state.last_scan_bytes = Some(outcome.scanned_bytes);
+            // 寫入分塊權威源; 常規側快取由 epoch 自然失效
+            let empty = outcome.base.is_none();
+            state.scan.replace_blocks(outcome.base);
+            if empty {
+                state.status = "沒有候選".to_string();
+            }
+            state.bump();
+        }
+    });
 }
 
 pub(crate) fn start_scan(app: &Arc<Mutex<AppState>>) {
@@ -573,33 +1150,73 @@ pub(crate) fn start_scan(app: &Arc<Mutex<AppState>>) {
             state.bump();
             return;
         }
+        let selected = selected_maps(&state);
+        if selected.is_empty() {
+            state.status = "未選擇映射".to_string();
+            state.bump();
+            return;
+        }
         let ty = state.scan_slot.ty(state.signed);
-        let bits = match ty.parse(&state.input) {
-            Some(v) => v,
-            None => {
-                state.status = "掃描數值格式錯誤".to_string();
+        let filter = match state.change_mode {
+            ChangeMode::ExactValue => match ty.parse(&state.input) {
+                Some(bits) => mem::ScanFilter::Exact(bits),
+                None => {
+                    state.status = "掃描數值格式錯誤".to_string();
+                    state.bump();
+                    return;
+                }
+            },
+            ChangeMode::Between => {
+                let Some(min) = ty.parse(&state.range_min) else {
+                    state.status = "範圍下限格式錯誤".to_string();
+                    state.bump();
+                    return;
+                };
+                let Some(max) = ty.parse(&state.range_max) else {
+                    state.status = "範圍上限格式錯誤".to_string();
+                    state.bump();
+                    return;
+                };
+                if matches!(mem::compare(ty, min, max), std::cmp::Ordering::Greater) {
+                    state.status = "範圍下限不可大於上限".to_string();
+                    state.bump();
+                    return;
+                }
+                mem::ScanFilter::Between { min, max }
+            }
+            _ => {
+                state.status = "首次掃描僅支援目標值或範圍".to_string();
                 state.bump();
                 return;
             }
         };
         state.scanning = true;
-        state.status = format!("掃描 {} = {} ...", ty.label(), ty.format(bits));
+        state.status = match filter {
+            mem::ScanFilter::Exact(bits) => format!("掃描 {} = {} ...", ty.label(), ty.format(bits)),
+            mem::ScanFilter::Between { min, max } => {
+                format!("掃描 {} 範圍 {} ~ {} ...", ty.label(), ty.format(min), ty.format(max))
+            }
+        };
         state.bump();
-        (state.pid, ty, bits, selected_maps(&state))
+        (state.pid, ty, filter, selected)
     };
     let app = Arc::clone(app);
     std::thread::spawn(move || {
-        let found = mem::scan_ranges(job.0, job.1, job.2, &job.3);
+        let outcome = mem::scan_ranges(job.0, job.1, job.2, &job.3);
         if let Ok(mut state) = app.lock() {
             state.scanning = false;
-            state.status = format!("掃描完成，找到 {} 個結果", found.len());
-            state.results = found;
+            state.status.clear();
+            state.last_scan_bytes = Some(outcome.scanned_bytes);
+            state.scan.replace_typed(outcome.results);
+            state.results_source = ResultsSource::Typed;
             state.results_epoch += 1;
             state.selected.clear();
-            state.agent_view.clear();
+            state.live_bits.clear();
+            state.reset_struct_view();
             state.bump();
         }
     });
+
 }
 
 pub(crate) fn start_refine(app: &Arc<Mutex<AppState>>) {
@@ -611,40 +1228,77 @@ pub(crate) fn start_refine(app: &Arc<Mutex<AppState>>) {
         if state.scanning {
             return;
         }
-        if state.results.is_empty() {
+        if state.scan.typed.is_empty() {
             state.status = "沒有可篩選的結果".to_string();
             state.bump();
             return;
         }
         let ty = state.scan_slot.ty(state.signed);
-        let delta = match state.change_mode {
-            ChangeMode::ExactValue | ChangeMode::IncreasedBy | ChangeMode::DecreasedBy => {
-                match ty.parse(&state.input) {
-                    Some(v) => v,
-                    None => {
-                        state.status = "掃描數值格式錯誤".to_string();
-                        state.bump();
-                        return;
-                    }
+        let filter = match state.change_mode {
+            ChangeMode::ExactValue => match ty.parse(&state.input) {
+                Some(v) => mem::RefineFilter::Exact(v),
+                None => {
+                    state.status = "掃描數值格式錯誤".to_string();
+                    state.bump();
+                    return;
                 }
+            },
+            ChangeMode::IncreasedBy => match ty.parse(&state.input) {
+                Some(v) => mem::RefineFilter::IncreasedBy(v),
+                None => {
+                    state.status = "掃描數值格式錯誤".to_string();
+                    state.bump();
+                    return;
+                }
+            },
+            ChangeMode::DecreasedBy => match ty.parse(&state.input) {
+                Some(v) => mem::RefineFilter::DecreasedBy(v),
+                None => {
+                    state.status = "掃描數值格式錯誤".to_string();
+                    state.bump();
+                    return;
+                }
+            },
+            ChangeMode::Between => {
+                let Some(min) = ty.parse(&state.range_min) else {
+                    state.status = "範圍下限格式錯誤".to_string();
+                    state.bump();
+                    return;
+                };
+                let Some(max) = ty.parse(&state.range_max) else {
+                    state.status = "範圍上限格式錯誤".to_string();
+                    state.bump();
+                    return;
+                };
+                if matches!(mem::compare(ty, min, max), std::cmp::Ordering::Greater) {
+                    state.status = "範圍下限不可大於上限".to_string();
+                    state.bump();
+                    return;
+                }
+                mem::RefineFilter::Between { min, max }
             }
-            _ => 0,
+            ChangeMode::AnyChange => mem::RefineFilter::AnyChange,
+            ChangeMode::Unchanged => mem::RefineFilter::Unchanged,
+            ChangeMode::Increased => mem::RefineFilter::Increased,
+            ChangeMode::Decreased => mem::RefineFilter::Decreased,
         };
         state.scanning = true;
         state.status = format!("篩選中（{}）...", state.change_mode.label());
         state.bump();
-        (state.pid, ty, state.change_mode, delta, state.results.clone())
+        (state.pid, ty, filter, state.scan.typed.clone())
     };
     let app = Arc::clone(app);
     std::thread::spawn(move || {
-        let found = mem::refine_entries(job.0, job.1, job.2, job.3, &job.4);
+        let found = mem::refine_entries(job.0, job.1, job.2, &job.3);
         if let Ok(mut state) = app.lock() {
             state.scanning = false;
-            state.status = format!("篩選完成，剩 {} 個結果", found.len());
-            state.results = found;
+            state.status.clear();
+            state.scan.replace_typed(found);
+            state.results_source = ResultsSource::Typed;
             state.results_epoch += 1;
             state.selected.clear();
-            state.agent_view.clear();
+            state.live_bits.clear();
+            state.reset_struct_view();
             state.bump();
         }
     });
@@ -660,23 +1314,131 @@ fn refresh_results_silent(app: &Arc<Mutex<AppState>>) {
         if state.scanning {
             return;
         }
-        if state.results.is_empty() {
+        // 區塊模式 size=0, 整批刷新會把 results 清空; 直接跳過
+        if state.scan_slot.is_interval() {
+            return;
+        }
+        if state.scan.typed.is_empty() {
             return;
         }
         let ty = state.scan_slot.ty(state.signed);
-        (state.pid, ty, state.results.clone(), state.results_epoch)
+        let targets: Vec<(u64, u8)> = state
+            .scan
+            .typed
+            .iter()
+            .map(|e| (e.addr, e.bit))
+            .collect();
+        (state.pid, ty, targets, state.results_epoch)
     };
     let app = Arc::clone(app);
     std::thread::spawn(move || {
-        let entries = mem::refresh_entries(job.0, job.1, &job.2);
+        // 輪詢只更新實時顯示快取; 掃描結果不可變, 嚴禁回寫
+        let mut live = HashMap::with_capacity(job.2.len());
+        let size = job.1.size();
+        for (addr, bit) in &job.2 {
+            let bits = match job.1 {
+                ValueType::BoolBit => crate::nb9::read_value(job.0, *addr, 1)
+                    .map(|v| (v >> bit) & 1),
+                _ => crate::nb9::read_value(job.0, *addr, size),
+            };
+            if let Some(bits) = bits {
+                live.insert(crate::mem::entry_key(*addr, *bit), bits);
+            }
+        }
         if let Ok(mut state) = app.lock() {
             // 副本陳化守護: 快照期間結果被清空/替換過, 這次的刷新直接作廢
             if state.results_epoch != job.3 {
                 return;
             }
-            state.results = entries;
-            // 同一輪: 以實刷新結果, 不變動世代
+            state.live_bits = live;
             state.bump();
+        }
+    });
+}
+
+fn prefetch_struct_windows(app: &Arc<Mutex<AppState>>, addrs: Vec<u64>) {
+    let job = {
+        let mut state = match app.lock() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let ty = state.scan_slot.ty(state.signed);
+        if !matches!(ty, ValueType::Float32 | ValueType::Double) || state.pid <= 0 {
+            for addr in addrs {
+                state.struct_pending.remove(&addr);
+            }
+            return;
+        }
+        let epoch = state.struct_epoch;
+        let anchor = state.struct_anchor;
+        let mut want = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            // 同一位址同一世代只請求一次, 背景完成前重複滾動不會重複 ioctl
+            if state.struct_pending.get(&addr) == Some(&epoch) {
+                continue;
+            }
+            state.struct_pending.insert(addr, epoch);
+            want.push(addr);
+        }
+        if want.is_empty() {
+            return;
+        }
+        (state.pid, ty, anchor, epoch, want)
+    };
+    let app = Arc::clone(app);
+    std::thread::spawn(move || {
+        let component = job.1.size();
+        let mut out = Vec::with_capacity(job.4.len());
+        for addr in &job.4 {
+            let offset = (job.2 * component) as u64;
+            let values = match addr.checked_sub(offset) {
+                Some(base) => mem::read_struct_components(job.0, job.1, base),
+                None => [None, None, None],
+            };
+            out.push((*addr, values));
+        }
+        if let Ok(mut state) = app.lock() {
+            let ok = state.struct_epoch == job.3
+                && state.struct_anchor == job.2
+                && state.scan_slot.ty(state.signed) == job.1;
+            let mut changed_any = false;
+            for (addr, values) in out {
+                if state.struct_pending.get(&addr) == Some(&job.3) {
+                    state.struct_pending.remove(&addr);
+                }
+                if !ok {
+                    continue;
+                }
+                match state.struct_cache.get_mut(&addr) {
+                    Some(existing)
+                        if existing.ty == job.1
+                            && existing.anchor == job.2
+                            && existing.epoch == job.3
+                            && existing.values == values =>
+                    {
+                        existing.at = Instant::now();
+                    }
+                    _ => {
+                        if state.struct_cache.len() >= 512 {
+                            state.struct_cache.clear();
+                        }
+                        state.struct_cache.insert(
+                            addr,
+                            StructWindow {
+                                ty: job.1,
+                                anchor: job.2,
+                                epoch: job.3,
+                                values,
+                                at: Instant::now(),
+                            },
+                        );
+                        changed_any = true;
+                    }
+                }
+            }
+            if changed_any {
+                state.bump();
+            }
         }
     });
 }
@@ -757,7 +1519,7 @@ impl UiHost {
         if screen_w == 0 || screen_h == 0 {
             return false;
         }
-        let (revision, visible, events, scanning, want_capture, refresh_interval, results_len) = {
+        let (revision, visible, events, scanning, want_capture, refresh_interval, results_len, interval_slot) = {
             let mut state = match app.lock() {
                 Ok(v) => v,
                 Err(_) => return false,
@@ -770,7 +1532,8 @@ impl UiHost {
                 state.scanning,
                 want_capture,
                 state.refresh_interval,
-                state.results.len(),
+                state.scan.typed.len(),
+                state.scan_slot.is_interval(),
             )
         };
         if want_capture {
@@ -803,6 +1566,7 @@ impl UiHost {
             });
         }
 
+        let lines = crate::lua_env::take_lines();
         if !visible {
             if self.last_visible {
                 for px in buf[..width * height].iter_mut() {
@@ -810,25 +1574,27 @@ impl UiHost {
                 }
                 self.last_visible = false;
                 self.last_rev = revision;
-                return true;
+                if lines.is_empty() {
+                    return true;
+                }
+            } else if lines.is_empty() {
+                return false;
+            } else {
+                // Lua 每幀都在畫: canvas 必須每幀保持全透明 + 新線, 否則舊線殘留
+                for px in buf[..width * height].iter_mut() {
+                    *px = [0, 0, 0, 0];
+                }
             }
-            return false;
+            draw_lua_lines(buf, width, height, &lines);
+            return true;
         }
 
+        // 區塊模式沒有逐筆帶型別刷新語意; 留著會用 size=0 重讀把 results 整個清掉
         let auto_refresh_due = results_len > 0
             && !scanning
+            && !interval_slot
             && refresh_interval > 0.0
             && self.last_auto_refresh.elapsed().as_secs_f32() >= refresh_interval;
-        let need = revision != self.last_rev
-            || !self.last_visible
-            || self.last_size != (width, height)
-            || self.last_screen != (screen_w, screen_h)
-            || !events.is_empty()
-            || self.ctx.has_requested_repaint()
-            || auto_refresh_due;
-        if !need {
-            return false;
-        }
 
         self.last_visible = true;
         self.last_size = (width, height);
@@ -866,13 +1632,15 @@ impl UiHost {
         let mut actions = Vec::new();
         let mut hit_rects: Vec<egui::Rect> = Vec::new();
         let out = {
-            let state = match app.lock() {
+            let mut state = match app.lock() {
                 Ok(v) => v,
                 Err(_) => return false,
             };
+            crate::lua_env::set_target_info(state.pid, state.module_base);
+            state.ppp = ppp;
             self.ctx.run_pass(raw, |ctx| {
                 self.keyboard.pump_events(ctx);
-                draw_ui(ctx, &state, &mut actions, &mut hit_rects, spinner);
+                draw_ui(ctx, &mut state, &mut actions, &mut hit_rects, spinner);
                 if let Some(rect) = self.keyboard.show(ctx) {
                     hit_rects.push(rect.expand(8.0));
                 }
@@ -883,10 +1651,14 @@ impl UiHost {
         }
 
         apply_actions(app, actions);
+        if let Ok(mut state) = app.lock() {
+            apply_lua_cmds(&mut state);
+        }
 
         for px in buf[..width * height].iter_mut() {
             *px = [0, 0, 0, 0];
         }
+        draw_lua_lines(buf, width, height, &lines);
         let mut out = out;
         let primitives = self.ctx.tessellate(out.shapes, out.pixels_per_point);
         let mut buffer = BufferMutRef::new(buf, width, height);
@@ -930,14 +1702,30 @@ fn configure_style(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
+fn selected_map_totals(state: &AppState) -> (u64, usize) {
+    let mut virtual_span = 0;
+    let mut selected_count = 0;
+    for (map, checked) in state.maps.iter().zip(state.map_checked.iter()) {
+        if *checked && !maps::is_absolute_excluded(map) {
+            virtual_span += map.end - map.start;
+            selected_count += 1;
+        }
+    }
+    (virtual_span, selected_count)
+}
+
+fn map_text_color(kind: maps::MapKind) -> Color32 {
+    match kind {
+        maps::MapKind::DefaultSelected => Color32::from_rgb(235, 235, 245),
+        maps::MapKind::DefaultExcluded => Color32::from_rgba_unmultiplied(235, 235, 245, 150),
+        maps::MapKind::AbsoluteExcluded => Color32::from_rgba_unmultiplied(235, 235, 245, 77),
+    }
+}
+
 pub(crate) fn apply_actions(app: &Arc<Mutex<AppState>>, actions: Vec<UiAction>) {
     for action in actions {
         apply_action(app, action);
     }
-}
-
-fn is_scannable(map: &MapRegion) -> bool {
-    map.perms.contains('r') && map.perms.contains('w') && !map.path.starts_with("/dev/")
 }
 
 pub(crate) fn hex_bytes(bits: u64, size: usize) -> String {
@@ -949,6 +1737,91 @@ pub(crate) fn hex_bytes(bits: u64, size: usize) -> String {
         s.push_str(&format!("{:02x}", (bits >> (i * 8)) & 0xff));
     }
     s
+}
+
+/// 把 Lua 這一幀的立即模式畫線疊到 canvas 上 (egui 渲染之前, 墊在所有窗口底下)
+fn draw_lua_lines(
+    buf: &mut [[u8; 4]],
+    width: usize,
+    height: usize,
+    lines: &[crate::lua_env::DrawLine],
+) {
+    if lines.is_empty() || width == 0 || height == 0 || buf.len() < width * height {
+        return;
+    }
+    for line in lines {
+        draw_line_px(buf, width, height, line.x0, line.y0, line.x1, line.y1, line.color);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_line_px(
+    buf: &mut [[u8; 4]],
+    width: usize,
+    height: usize,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    color: [u8; 4],
+) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let steps = dx.abs().max(dy.abs()).ceil() as i32;
+    if steps <= 0 {
+        blend_px(buf, width, height, x0 as i32, y0 as i32, color, 1.0);
+        return;
+    }
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        blend_px(
+            buf,
+            width,
+            height,
+            (x0 + dx * t) as i32,
+            (y0 + dy * t) as i32,
+            color,
+            1.0,
+        );
+    }
+}
+
+fn blend_px(
+    buf: &mut [[u8; 4]],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    color: [u8; 4],
+    coverage: f32,
+) {
+    if x < 0 || y < 0 || x as usize >= width || y as usize >= height {
+        return;
+    }
+    let idx = y as usize * width + x as usize;
+    if idx >= buf.len() {
+        return;
+    }
+    let cov = coverage.clamp(0.0, 1.0);
+    let sa = (color[3] as f32 * cov).round() as u32;
+    if sa == 0 {
+        return;
+    }
+    let sr = (color[0] as u32 * sa + 127) / 255;
+    let sg = (color[1] as u32 * sa + 127) / 255;
+    let sb = (color[2] as u32 * sa + 127) / 255;
+    let inv = 255 - sa;
+    let dst = buf[idx];
+    let r = sr + (dst[0] as u32 * inv + 127) / 255;
+    let g = sg + (dst[1] as u32 * inv + 127) / 255;
+    let b = sb + (dst[2] as u32 * inv + 127) / 255;
+    let a = sa + (dst[3] as u32 * inv + 127) / 255;
+    buf[idx] = [
+        r.min(255) as u8,
+        g.min(255) as u8,
+        b.min(255) as u8,
+        a.min(255) as u8,
+    ];
 }
 
 fn format_size(bytes: u64) -> String {
@@ -978,7 +1851,7 @@ fn truncate(text: &str, max: usize) -> String {
 
 fn draw_ui(
     ctx: &egui::Context,
-    state: &AppState,
+    state: &mut AppState,
     actions: &mut Vec<UiAction>,
     hit_rects: &mut Vec<egui::Rect>,
     spinner: usize,
@@ -1050,6 +1923,12 @@ fn draw_ui(
                     });
             }
 
+
+
+
+
+
+
             // 掃描控制面板（仿工具列直屬佈局，全屏分屏）
             // 依內容區比例切換: 闊/高 > 1 用左右分屏, 否則上下分屏
             if state.tab == Tab::Scan {
@@ -1057,7 +1936,7 @@ fn draw_ui(
                     egui::Panel::left("scan-controls")
                         .resizable(true)
                         .default_size((ui.available_width() * 0.42).max(320.0))
-                        .min_size(260.0)
+                        .min_size(200.0)
                         .max_size(520.0)
                         .frame(Frame::NONE)
                         .show(ui, |ui| draw_scan_controls(ui, state, actions, spinner));
@@ -1126,6 +2005,39 @@ fn draw_ui(
             })
         {
             hit_rects.push(r.response.rect.expand(8.0));
+        }
+    }
+
+    crate::touch_targets::draw(ctx, state, hit_rects);
+
+    if state.console_open {
+        let mut console_open = true;
+        let console_pos = egui::pos2(screen.width() * 0.05, screen.height() * 0.55);
+        if let Some(r) = egui::Window::new("終端台")
+            .id(egui::Id::unique("theraohe-console"))
+            .collapsible(true)
+            .resizable(true)
+            .default_pos(console_pos)
+            .default_size(vec2(screen.width() * 0.9, screen.height() * 0.35))
+            .min_size(vec2(160.0, 80.0))
+            .max_size(vec2(screen.width(), screen.height()))
+            .constrain(true)
+            .order(egui::Order::Foreground)
+            .open(&mut console_open)
+            .show(ctx, |ui| {
+                let text = crate::console::text().unwrap_or_default();
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(text).monospace().size(12.0));
+                    });
+            })
+        {
+            hit_rects.push(r.response.rect.expand(8.0));
+        }
+        if !console_open {
+            actions.push(UiAction::ToggleConsole);
         }
     }
 
@@ -1259,18 +2171,24 @@ fn draw_maps(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
         ui.label("尚未附加行程");
         return;
     }
-    let checked_bytes: u64 = state
-        .maps
-        .iter()
-        .zip(state.map_checked.iter())
-        .filter(|(_, checked)| **checked)
-        .map(|(m, _)| m.end - m.start)
-        .sum();
+    let order = maps::display_order(&state.maps);
+    let (checked_bytes, selected_count) = selected_map_totals(state);
+    let mut excluded_count = 0usize;
+    let mut absolute_count = 0usize;
+    for map in &state.maps {
+        match maps::classify_map(map) {
+            maps::MapKind::DefaultExcluded => excluded_count += 1,
+            maps::MapKind::AbsoluteExcluded => absolute_count += 1,
+            maps::MapKind::DefaultSelected => {}
+        }
+    }
     ui.label(format!(
-        "映射 {} 個，共 {}，不含 {} 個不可掃描段",
+        "映射 {} 個，選取 {} 個，虛擬範圍 {}，預設排除 {} 個，絕對不可掃描 {} 個",
         state.maps.len(),
+        selected_count,
         format_size(checked_bytes),
-        state.maps.len() - state.map_checked.iter().filter(|&&c| c).count()
+        excluded_count,
+        absolute_count
     ));
     ui.spacing_mut().item_spacing.y = 4.0;
     let row_h = ui.spacing().interact_size.y;
@@ -1292,7 +2210,7 @@ fn draw_maps(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
                 ui.label("位址範圍");
             });
             header.col(|ui| {
-                ui.label("大小");
+                ui.label("虛擬大小");
             });
             header.col(|ui| {
                 ui.label("權限");
@@ -1302,14 +2220,16 @@ fn draw_maps(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
             });
         })
         .body(|body| {
-            body.rows(row_h, state.maps.len(), |mut row| {
-                let idx = row.index();
+            body.rows(row_h, order.len(), |mut row| {
+                let idx = order[row.index()];
                 let map = &state.maps[idx];
-                let scannable = is_scannable(map);
+                let kind = maps::classify_map(map);
+                let absolute = kind == maps::MapKind::AbsoluteExcluded;
+                let text_color = map_text_color(kind);
                 row.col(|ui| {
                     let mut checked = state.map_checked.get(idx).copied().unwrap_or(false);
                     if ui
-                        .add_enabled(scannable, egui::Checkbox::new(&mut checked, ""))
+                        .add_enabled(!absolute, egui::Checkbox::new(&mut checked, ""))
                         .changed()
                     {
                         actions.push(UiAction::ToggleMap(idx));
@@ -1317,28 +2237,40 @@ fn draw_maps(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
                 });
                 row.col(|ui| {
                     let text = format!("{:012x}-{:012x}", map.start, map.end);
-                    ui.add(egui::Label::new(egui::RichText::new(text).monospace()).truncate());
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(text).monospace().color(text_color),
+                        )
+                        .truncate(),
+                    );
                 });
                 row.col(|ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(format!("{}", map.end - map.start));
+                        ui.label(
+                            egui::RichText::new(format_size(map.end - map.start))
+                                .color(text_color),
+                        );
                     });
                 });
                 row.col(|ui| {
                     ui.horizontal(|ui| {
                         for c in map.perms.chars() {
-                            let color = match c {
-                                'r' => Color32::from_rgb(0x30, 0xd1, 0x58),
-                                'w' => Color32::from_rgb(0xff, 0xd6, 0x0a),
-                                'x' => Color32::from_rgb(0xff, 0x45, 0x3a),
-                                _ => Color32::from_rgba_unmultiplied(235, 235, 245, 77),
+                            let color = if absolute {
+                                text_color
+                            } else {
+                                match c {
+                                    'r' => Color32::from_rgb(0x30, 0xd1, 0x58),
+                                    'w' => Color32::from_rgb(0xff, 0xd6, 0x0a),
+                                    'x' => Color32::from_rgb(0xff, 0x45, 0x3a),
+                                    _ => Color32::from_rgba_unmultiplied(235, 235, 245, 77),
+                                }
                             };
                             ui.label(egui::RichText::new(c.to_string()).monospace().color(color));
                         }
                     });
                 });
                 row.col(|ui| {
-                    ui.label(truncate(&map.path, 48));
+                    ui.label(egui::RichText::new(truncate(&map.path, 48)).color(text_color));
                 });
             });
         });
@@ -1395,10 +2327,62 @@ fn draw_scan_controls(
     actions: &mut Vec<UiAction>,
     spinner: usize,
 ) {
-    let strip_h = ui.spacing().interact_size.y + 16.0;
+    let scan_label = if state.scan_slot.is_interval() {
+        "建立區塊快照"
+    } else if state.scan.typed.is_empty() {
+        "首次掃描(依目標值)"
+    } else {
+        "新一輪掃描(依目標值)"
+    };
+
+    egui::Panel::bottom("scan-buttons")
+        .resizable(false)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let (span_bytes, _) = selected_map_totals(state);
+            let estimate = estimate_scan_bytes(state.scan_slot, span_bytes);
+            let available = mem::available_memory_bytes();
+            let estimate_text = match available {
+                Some(a) => format!("預計 {} / {}", format_size(estimate), format_size(a)),
+                None => format!("預計 {} / 未知", format_size(estimate)),
+            };
+            let insufficient = available.is_some_and(|a| estimate > a);
+            let text_color = ui.visuals().text_color();
+            ui.horizontal_wrapped(|ui| {
+                let color = if insufficient { CHANGED_COLOR } else { text_color };
+                ui.label(egui::RichText::new(estimate_text).color(color));
+                if let Some(base) = &state.scan.blocks {
+                    ui.label(format!(
+                        "候選 {} 分塊 / {}",
+                        base.candidate_blocks,
+                        format_size(base.candidate_bytes)
+                    ));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let w = (ui.available_width() - 6.0) / 2.0;
+                let refine_enabled =
+                    !state.scan.typed.is_empty() || state.scan.blocks.is_some();
+                ui.add_enabled_ui(refine_enabled, |ui| {
+                    if ui
+                        .add_sized([w, ui.spacing().interact_size.y], Button::new("篩選結果"))
+                        .clicked()
+                    {
+                        actions.push(UiAction::StartRefine);
+                    }
+                });
+                if ui
+                    .add_sized([w, ui.spacing().interact_size.y], Button::new(scan_label))
+                    .clicked()
+                {
+                    actions.push(UiAction::StartScan);
+                }
+            });
+        });
+
     ScrollArea::vertical()
         .auto_shrink([false, false])
-        .max_height((ui.available_height() - strip_h).max(80.0))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
 
@@ -1408,14 +2392,16 @@ fn draw_scan_controls(
                     draw_type_grid(ui, state, actions, &TypeSlot::MAIN);
                     ui.add_space(8.0);
 
-                    ui.horizontal(|ui| {
-                        if ui.add(RadioButton::new(state.signed, "有符號")).clicked() {
-                            actions.push(UiAction::SetSigned(true));
-                        }
-                        if ui.add(RadioButton::new(!state.signed, "無符號")).clicked() {
-                            actions.push(UiAction::SetSigned(false));
-                        }
-                    });
+                    if !state.scan_slot.is_interval() {
+                        ui.horizontal(|ui| {
+                            if ui.add(RadioButton::new(state.signed, "有符號")).clicked() {
+                                actions.push(UiAction::SetSigned(true));
+                            }
+                            if ui.add(RadioButton::new(!state.signed, "無符號")).clicked() {
+                                actions.push(UiAction::SetSigned(false));
+                            }
+                        });
+                    }
                     ui.add_space(8.0);
 
                     let advanced = CollapsingHeader::new("Advanced")
@@ -1435,12 +2421,15 @@ fn draw_scan_controls(
                 .open(Some(state.cond_open))
                 .show(ui, |ui| {
                     let bool_slot = state.scan_slot == TypeSlot::Bool || state.scan_slot == TypeSlot::Bit;
-                    if bool_slot
+                    let interval = fuzzy_active(state);
+                    if interval
+                        && !matches!(state.change_mode, ChangeMode::AnyChange | ChangeMode::Unchanged)
+                    {
+                        actions.push(UiAction::ChangeMode(ChangeMode::AnyChange));
+                    } else if bool_slot
                         && !matches!(
                             state.change_mode,
-                            ChangeMode::ExactValue
-                                | ChangeMode::AnyChange
-                                | ChangeMode::Unchanged
+                            ChangeMode::ExactValue | ChangeMode::AnyChange | ChangeMode::Unchanged
                         )
                     {
                         actions.push(UiAction::ChangeMode(ChangeMode::ExactValue));
@@ -1455,21 +2444,16 @@ fn draw_scan_controls(
                             ChangeMode::Increased,
                             ChangeMode::Decreased,
                         ] {
-                            if bool_slot
-                                && !matches!(mode, ChangeMode::AnyChange | ChangeMode::Unchanged)
-                            {
-                                continue;
-                            }
                             let selected = state.change_mode == mode;
+                            let enabled = condition_mode_enabled(state, mode);
                             let button = Button::selectable(selected, mode.label());
-                            if ui.add(button).clicked() {
+                            if ui.add_enabled(enabled, button).clicked() {
                                 actions.push(UiAction::ChangeMode(mode));
                             }
                         }
-                        if !bool_slot {
-                            condition_row(ui, state, actions, ChangeMode::IncreasedBy);
-                            condition_row(ui, state, actions, ChangeMode::DecreasedBy);
-                        }
+                        condition_row(ui, state, actions, ChangeMode::IncreasedBy);
+                        condition_row(ui, state, actions, ChangeMode::DecreasedBy);
+                        condition_row(ui, state, actions, ChangeMode::Between);
                     });
                 });
             if cond_section.header_response.clicked() {
@@ -1481,31 +2465,6 @@ fn draw_scan_controls(
             }
         });
 
-    egui::Panel::bottom("scan-buttons")
-        .resizable(false)
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let w = (ui.available_width() - 6.0) / 2.0;
-                let refine_enabled = !state.results.is_empty();
-                ui.add_enabled_ui(refine_enabled, |ui| {
-                    if ui.add_sized([w, ui.spacing().interact_size.y], Button::new("篩選結果")).clicked()
-                    {
-                        actions.push(UiAction::StartRefine);
-                    }
-                });
-                let scan_label = if state.results.is_empty() {
-                    "首次掃描(依目標值)"
-                } else {
-                    "新一輪掃描(依目標值)"
-                };
-                if ui.add_sized([w, ui.spacing().interact_size.y], Button::new(scan_label)).clicked()
-                {
-                    actions.push(UiAction::StartScan);
-                }
-            });
-        });
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1519,9 +2478,14 @@ fn condition_row(
     let bool_slot = state.scan_slot == TypeSlot::Bool || state.scan_slot == TypeSlot::Bit;
     let label = mode.label();
     let selected = state.change_mode == mode;
+    let is_range = mode == ChangeMode::Between;
+    let enabled = condition_mode_enabled(state, mode);
     let show_input = matches!(
         mode,
-        ChangeMode::ExactValue | ChangeMode::IncreasedBy | ChangeMode::DecreasedBy
+        ChangeMode::ExactValue
+            | ChangeMode::IncreasedBy
+            | ChangeMode::DecreasedBy
+            | ChangeMode::Between
     );
     // Frame::group 會直接 advance_cursor_after_rect，繞過換行佈局的協商；
     // 這裡手工量尺寸並 allocate_space，空間不足時才會整組換行，排法與 horizontal_wrapped 內的按鈕一致
@@ -1542,14 +2506,29 @@ fn condition_row(
         ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), body_font.clone(), text_color).size().x)
     };
     let button_w = measure(ui, label) + 2.0 * button_padding_x;
+    let single_input_w = |ui: &mut egui::Ui, text: &str, hint: &str| {
+        let text_w = measure(ui, text);
+        let hint_w = measure(ui, hint);
+        text_w.max(hint_w).max(40.0) + 20.0
+    };
+    let range_min_w = if is_range {
+        single_input_w(ui, &state.range_min, "Min")
+    } else {
+        0.0
+    };
+    let range_max_w = if is_range {
+        single_input_w(ui, &state.range_max, "Max")
+    } else {
+        0.0
+    };
     let input_w = if !show_input {
         0.0
-    } else if bool_slot {
+    } else if mode == ChangeMode::ExactValue && bool_slot {
         measure(ui, "True") + icon_spacing_x + icon_width
+    } else if is_range {
+        range_min_w + item_spacing_x + range_max_w
     } else {
-        let text_w = measure(ui, &state.input.clone());
-        let hint_w = measure(ui, "點此輸入");
-        text_w.max(hint_w).max(40.0) + 20.0
+        single_input_w(ui, &state.input, "點此輸入")
     };
     let inner_w = button_w + if show_input { item_spacing_x + input_w } else { 0.0 };
     let (_id, rect) = ui.allocate_space(vec2(inner_w + 2.0 * MARGIN, interact_h + 2.0 * MARGIN));
@@ -1564,12 +2543,37 @@ fn condition_row(
             .layout(Layout::left_to_right(Align::Center)),
     );
     content.spacing_mut().item_spacing.x = item_spacing_x;
-    if content.add(Button::selectable(selected, label)).clicked() {
-        actions.push(UiAction::ChangeMode(mode));
+    if enabled {
+        if content.add(Button::selectable(selected, label)).clicked() {
+            actions.push(UiAction::ChangeMode(mode));
+        }
+    } else {
+        let _ = content.add_enabled(false, Button::selectable(selected, label));
     }
-    if show_input {
-        if bool_slot {
+    if show_input && enabled {
+        if mode == ChangeMode::ExactValue && bool_slot {
             draw_typed_input(&mut content, state, actions);
+        } else if is_range {
+            let mut min = state.range_min.clone();
+            let resp = content.add(
+                egui::TextEdit::singleline(&mut min)
+                    .hint_text("Min")
+                    .char_limit(32)
+                    .desired_width(range_min_w),
+            );
+            if resp.changed() {
+                actions.push(UiAction::SetRangeMin(min));
+            }
+            let mut max = state.range_max.clone();
+            let resp = content.add(
+                egui::TextEdit::singleline(&mut max)
+                    .hint_text("Max")
+                    .char_limit(32)
+                    .desired_width(range_max_w),
+            );
+            if resp.changed() {
+                actions.push(UiAction::SetRangeMax(max));
+            }
         } else {
             let mut text = state.input.clone();
             let resp = content.add(
@@ -1585,25 +2589,187 @@ fn condition_row(
     }
 }
 
+fn estimate_scan_bytes(slot: TypeSlot, span_bytes: u64) -> u64 {
+    match slot.interval_block_bytes() {
+        Some(block) => {
+            let blocks = span_bytes.saturating_add(block - 1) / block;
+            blocks.saturating_mul(FUZZY_RECORD_BYTES)
+                .saturating_add(FUZZY_SCAN_BUFFER)
+        }
+        None => FUZZY_SCAN_BUFFER,
+    }
+}
+
+fn fuzzy_active(state: &AppState) -> bool {
+    state.scan_slot.is_interval()
+}
+
+fn condition_mode_enabled(state: &AppState, mode: ChangeMode) -> bool {
+    if fuzzy_active(state) {
+        return matches!(mode, ChangeMode::AnyChange | ChangeMode::Unchanged);
+    }
+    let bool_slot = state.scan_slot == TypeSlot::Bool || state.scan_slot == TypeSlot::Bit;
+    // 位元/布林只有 0/1: 增減幅度無意義, 但任意變化/原樣正是切換態旗標的篩選手段
+    if bool_slot {
+        return matches!(
+            mode,
+            ChangeMode::ExactValue | ChangeMode::AnyChange | ChangeMode::Unchanged
+        );
+    }
+    // 展開出的是當次全新 bits, 本身就是合法「前值快照」, 相對條件可安全使用
+    true
+}
+
+fn fuzzy_nth(base: &mem::FuzzyBase, want: usize) -> Option<(u64, u64, mem::FuzzyBlock)> {
+    let mut index = 0usize;
+    let mut seen = 0usize;
+    for map in &base.spans {
+        let mut start = map.start;
+        while start < map.end {
+            let end = (start + base.block_bytes).min(map.end);
+            if crate::mem::mask_get(&base.kept_mask, index) {
+                let block = base.blocks[index];
+                if seen == want {
+                    return Some((start, end, block));
+                }
+                seen += 1;
+            }
+            index += 1;
+            start = end;
+        }
+    }
+    None
+}
+
+fn draw_fuzzy_results(ui: &mut egui::Ui, base: &mem::FuzzyBase) {
+    ui.label(format!(
+        "區塊候選 {} 分塊 / {}",
+        base.candidate_blocks,
+        format_size(base.candidate_bytes)
+    ));
+    const PREVIEW_ROWS: usize = 256;
+    let shown = base.candidate_blocks.min(PREVIEW_ROWS);
+    // TableBuilder 的欄分隔線以父 ui 的 min_rect 為底, 需要與分隔線所在的 Panel 隔離
+    ui.scope(|ui| {
+        let w = ui.available_width();
+        let range_w = (w * 0.56).min(260.0);
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .vscroll(true)
+            .sense(egui::Sense::click())
+            .drag_to_scroll(egui::scroll_area::DragScroll::Always)
+            .column(Column::initial(range_w).at_least(120.0).clip(true))
+            .column(Column::remainder().at_least(120.0).clip(true))
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.label("範圍");
+                });
+                header.col(|ui| {
+                    ui.label("雜湊");
+                });
+            })
+            .body(|body| {
+                body.rows(24.0, shown, |mut row| {
+                    let Some((start, end, block)) = fuzzy_nth(base, row.index()) else {
+                        return;
+                    };
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("0x{start:012x}-0x{end:012x}"))
+                                    .monospace(),
+                            )
+                            .truncate(),
+                        );
+                    });
+                    row.col(|ui| {
+                        let mut text = egui::RichText::new(format!("0x{:016x}", block.hash)).monospace();
+                        if block.changed {
+                            text = text.color(CHANGED_COLOR);
+                        }
+                        ui.add(egui::Label::new(text).truncate());
+                    });
+                });
+            });
+    });
+    if base.candidate_blocks > shown {
+        ui.label(format!("… 僅顯示前 {} 行", shown));
+    }
+}
+
 fn draw_results(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
     egui::Panel::bottom("scan-results-bottom")
         .resizable(false)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let theme = ui.visuals().selection.bg_fill;
-            ui.label(egui::RichText::new("主題色=選中").background_color(theme));
+            let struct_section = CollapsingHeader::new("Advanced")
+                .open(Some(state.struct_open))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("結構解析:");
+                        let mut kind = state.struct_view_kind;
+                        egui::ComboBox::from_id_salt("struct-view-kind")
+                            .width(110.0)
+                            .selected_text(kind.label())
+                            .show_ui(ui, |ui| {
+                                for option in StructViewKind::ALL {
+                                    ui.selectable_value(&mut kind, option, option.label());
+                                }
+                            });
+                        if kind != state.struct_view_kind {
+                            actions.push(UiAction::SetStructViewKind(kind));
+                        }
+                        if kind != StructViewKind::None {
+                            for (axis, label) in kind.axis_labels().into_iter().enumerate() {
+                                let selected = state.struct_anchor == axis;
+                                if ui.add(Button::selectable(selected, label)).clicked() {
+                                    actions.push(UiAction::SetStructAnchor(axis));
+                                }
+                            }
+                        }
+                    });
+                });
+            if struct_section.header_response.clicked() {
+                actions.push(UiAction::ToggleStructOpen);
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(egui::RichText::new("已選中").background_color(theme));
+                ui.label(
+                    egui::RichText::new("自上次掃描後已變化").color(CHANGED_COLOR),
+                );
+            });
         });
 
-    if state.results.is_empty() {
+    if state.scan_slot.is_interval() {
+        if let Some(base) = &state.scan.blocks {
+            draw_fuzzy_results(ui, base);
+        } else {
+            ui.label("尚無候選，請先附加行程並按建立區塊快照");
+        }
+        return;
+    }
+
+    if state.scan.typed.is_empty() {
         ui.label("尚無結果，請先附加行程並掃描");
         return;
     }
-    ui.label(format!("{} 個結果", state.results.len()));
+    ui.label(format!(
+        "{} 個結果（權威源：{}）",
+        state.scan.typed.len(),
+        state.scan.authority.label()
+    ));
     let ty = state.scan_slot.ty(state.signed);
     let size = ty.size();
     let w = ui.available_width();
     let addr_w = (w * 0.36).min(200.0);
     let raw_w = (w * 0.30).min(260.0);
+    let float_view = matches!(ty, ValueType::Float32 | ValueType::Double)
+        && state.struct_view_kind != StructViewKind::None;
+    let row_h = if float_view { 60.0 } else { 24.0 };
+    let mut struct_requests = Vec::new();
     // TableBuilder 的欄分隔線以父 ui 的 min_rect 為底, 而 Panel::show 會把底欄 rect
     // 併進父 min_rect, 分隔線會穿透底欄, 故表格包一層 scope 隔離
     ui.scope(|ui| {
@@ -1621,54 +2787,95 @@ fn draw_results(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>
                 ui.label("位址");
             });
             header.col(|ui| {
-                ui.label("原始內容");
+                ui.label("值");
             });
             header.col(|ui| {
                 ui.label("解析值");
             });
         })
         .body(|body| {
-            body.rows(24.0, state.results.len(), |mut row| {
+            body.rows(row_h, state.scan.typed.len(), |mut row| {
                 let idx = row.index();
-                let entry = &state.results[idx];
+                let entry = &state.scan.typed[idx];
                 let addr = entry.addr;
-                // 自選中後變更: 黃字
-                let changed = state
-                    .selected
-                    .get(&addr)
-                    .is_some_and(|&bits| bits != entry.bits);
-                row.set_selected(
-                    state.selected.contains_key(&addr) || state.agent_view.contains(&addr),
-                );
+                let key = crate::mem::entry_key(addr, entry.bit);
+                let shown_bits = state.live_bits.get(&key).copied().unwrap_or(entry.bits);
+                let changed = shown_bits != entry.bits;
+                let struct_cache = float_view
+                    .then(|| {
+                        state.struct_cache.get(&addr).filter(|w| {
+                            w.ty == ty
+                                && w.anchor == state.struct_anchor
+                                && w.epoch == state.struct_epoch
+                        })
+                    })
+                    .flatten();
+                let need_struct = float_view
+                    && match struct_cache {
+                        Some(w) => {
+                            state.refresh_interval > 0.0
+                                && w.at.elapsed().as_secs_f32() >= state.refresh_interval
+                        }
+                        None => true,
+                    };
+                if need_struct && state.struct_pending.get(&addr) != Some(&state.struct_epoch) {
+                    struct_requests.push(addr);
+                }
+                row.set_selected(state.selected.contains(&key));
                 row.col(|ui| {
-                    let text = format!("0x{:012x}", entry.addr);
-                    let resp = ui.add(
-                        egui::Label::new(egui::RichText::new(text).monospace())
-                            .truncate()
-                            .sense(egui::Sense::click()),
+                    let text = if matches!(ty, ValueType::BoolBit) {
+                        format!("0x{:012x}({})", entry.addr, entry.bit)
+                    } else {
+                        format!("0x{:012x}", entry.addr)
+                    };
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(text).monospace()).truncate(),
                     );
-                    if resp.clicked() {
-                        let copy = format!("0x{:x} = {}", entry.addr, ty.format(entry.bits));
-                        ui.ctx().copy_text(copy);
+                });
+                row.col(|ui| {
+                    // Bit 的值就是該位的 0/1; 原始內容欄沿用該 bit 值
+                    let text = if matches!(ty, ValueType::BoolBit) {
+                        format!("{}", shown_bits as u8)
+                    } else {
+                        hex_bytes(shown_bits, size)
+                    };
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(text).monospace()).truncate(),
+                    );
+                });
+                row.col(|ui| {
+                    if float_view {
+                        let prefixes = state.struct_view_kind.axis_prefixes();
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for (axis, prefix) in prefixes.into_iter().enumerate() {
+                                let bits = if axis == state.struct_anchor {
+                                    Some(shown_bits)
+                                } else {
+                                    struct_cache.and_then(|w| w.values[axis])
+                                };
+                                let mut text = RichText::new(format!(
+                                    "{}={}",
+                                    prefix,
+                                    bits.map(|bits| format_float_bits(ty, bits))
+                                        .unwrap_or_else(|| "...".to_string())
+                                ))
+                                .monospace();
+                                if axis == state.struct_anchor {
+                                    text = text.color(if changed { CHANGED_COLOR } else { STRUCT_ANCHOR_COLOR });
+                                }
+                                ui.label(text);
+                            }
+                        });
+                    } else {
+                        let text = egui::RichText::new(ty.format(shown_bits));
+                        let text = if changed {
+                            text.color(CHANGED_COLOR)
+                        } else {
+                            text
+                        };
+                        ui.add(egui::Label::new(text).truncate());
                     }
-                });
-                row.col(|ui| {
-                    let text = egui::RichText::new(hex_bytes(entry.bits, size)).monospace();
-                    let text = if changed {
-                        text.color(CHANGED_COLOR)
-                    } else {
-                        text
-                    };
-                    ui.add(egui::Label::new(text).truncate());
-                });
-                row.col(|ui| {
-                    let text = egui::RichText::new(ty.format(entry.bits));
-                    let text = if changed {
-                        text.color(CHANGED_COLOR)
-                    } else {
-                        text
-                    };
-                    ui.add(egui::Label::new(text).truncate());
                 });
                 if row.response().clicked() {
                     actions.push(UiAction::ToggleResultSelect(idx));
@@ -1676,9 +2883,21 @@ fn draw_results(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>
             });
         });
     });
+    if !struct_requests.is_empty() {
+        actions.push(UiAction::PrefetchStructWindows(struct_requests));
+    }
 }
 
-const CHANGED_COLOR: Color32 = Color32::from_rgb(255, 200, 0);
+fn format_float_bits(ty: ValueType, bits: u64) -> String {
+    match ty {
+        ValueType::Float32 => format!("{:.3}", f32::from_bits(bits as u32)),
+        ValueType::Double => format!("{:.3}", f64::from_bits(bits)),
+        _ => ty.format(bits),
+    }
+}
+
+const CHANGED_COLOR: Color32 = Color32::from_rgb(255, 45, 85);
+const STRUCT_ANCHOR_COLOR: Color32 = Color32::from_rgb(135, 206, 250);
 
 fn draw_hex(ui: &mut egui::Ui, state: &AppState) {
     ScrollArea::vertical()
@@ -1711,11 +2930,295 @@ fn draw_hex(ui: &mut egui::Ui, state: &AppState) {
         });
 }
 
-fn draw_lua(ui: &mut egui::Ui, _state: &AppState) {
+fn draw_lua(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Lua");
     ui.add_space(6.0);
-    ui.label("Lua 支援尚未實裝。");
-    ui.label("預留給腳本化的內存操作（讀寫、掃描、斷點）。");
+
+    let Some(dir) = lua_env::dir() else {
+        ui.label("無法定位二進制路徑");
+        return;
+    };
+    ui.horizontal(|ui| {
+        if ui.button("重新載入").clicked() {
+            state.lua_scripts = lua_env::load_all();
+            state.bump();
+        }
+        ui.label(RichText::new(dir.display().to_string()).monospace().size(12.0));
+    });
+    ui.add_space(6.0);
+
+    if state.lua_scripts.is_empty() {
+        ui.label("Lua/ 目錄為空或不存在");
+        return;
+    }
+    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        for idx in 0..state.lua_scripts.len() {
+            let name = state.lua_scripts[idx].file_name.clone();
+            CollapsingHeader::new(&name)
+                .default_open(true)
+                .show(ui, |ui| draw_lua_script(ui, state, idx));
+            ui.add_space(4.0);
+        }
+    });
+}
+
+fn draw_lua_script(ui: &mut egui::Ui, state: &mut AppState, idx: usize) {
+    let script = &mut state.lua_scripts[idx];
+    if let Some(err) = &script.error {
+        ui.label(RichText::new(err).monospace().size(12.0).color(Color32::LIGHT_RED));
+        ui.add_space(4.0);
+    }
+
+    let functions = script.functions.clone();
+    let variables = script.variables.clone();
+    if functions.is_empty() && variables.is_empty() {
+        ui.label(RichText::new("(無反射項目)").color(Color32::GRAY));
+        return;
+    }
+
+    if !functions.is_empty() {
+        ui.label("函式");
+        ui.horizontal_wrapped(|ui| {
+            for name in &functions {
+                if ui.button(name).clicked() {
+                    lua_env::call(&mut state.lua_scripts[idx], name);
+                }
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    if !variables.is_empty() {
+        ui.label("變數");
+        for name in &variables {
+            draw_lua_variable(ui, idx, name, state);
+        }
+    }
+}
+
+fn draw_lua_variable(ui: &mut egui::Ui, idx: usize, name: &str, state: &mut AppState) {
+    use mlua::Value;
+    let script = &mut state.lua_scripts[idx];
+    let value = script.lua.globals().get::<Value>(name).unwrap_or(Value::Nil);
+    ui.horizontal(|ui| {
+        match value {
+            Value::Integer(mut x) => {
+                ui.label(RichText::new(name).monospace());
+                if ui.add(egui::DragValue::new(&mut x)).changed() {
+                    lua_env::set_global(script, name, Value::Integer(x));
+                }
+            }
+            Value::Number(x) => {
+                let mut v = x;
+                ui.label(RichText::new(name).monospace());
+                if ui.add(egui::DragValue::new(&mut v)).changed() {
+                    lua_env::set_global(script, name, Value::Number(v));
+                }
+            }
+            Value::Boolean(b) => {
+                let mut v = b;
+                if ui.checkbox(&mut v, name).changed() {
+                    lua_env::set_global(script, name, Value::Boolean(v));
+                }
+            }
+            Value::String(s) => {
+                let mut v = s.to_string_lossy();
+                ui.label(RichText::new(name).monospace());
+                if ui.add(egui::TextEdit::singleline(&mut v)).changed() {
+                    match script.lua.create_string(v) {
+                        Ok(ls) => lua_env::set_global(script, name, Value::String(ls)),
+                        Err(e) => script.error = Some(format!("{name}: {e}")),
+                    }
+                }
+            }
+            other => {
+                let kind = match other {
+                    Value::Nil => "nil",
+                    Value::Table(_) => "table",
+                    Value::Function(_) => "function",
+                    Value::Thread(_) => "thread",
+                    Value::UserData(_) => "userdata",
+                    Value::LightUserData(_) => "lightuserdata",
+                    Value::Error(_) => "error",
+                    _ => "other",
+                };
+                ui.label(RichText::new(format!("{name} = <{kind}>")).monospace());
+            }
+        }
+    });
+}
+
+/// Insertion indicator, derived from the active theme (no hard-coded colors).
+fn insertion_stroke(ui: &egui::Ui, width: f32) -> egui::Stroke {
+    egui::Stroke::new(width, ui.visuals().selection.stroke.color)
+}
+
+fn draw_shortcut_layout(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
+    // If there is a drop, store the item being dragged, and the destination for the drop.
+    let mut row_from = None;
+    let mut row_to = None;
+    let mut chip_from = None;
+    let mut chip_to = None;
+
+    let (_, empty_drop) = ui.dnd_drop_zone::<DragPayload, ()>(Frame::new(), |ui| {
+        ui.vertical(|ui| {
+            for (row_idx, chips) in state.shortcut_layout.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    // Left grip: the vertical dnd drag handle.
+                    ui.dnd_drag_source(
+                        egui::Id::unique(("shortcut_layout_bar", row_idx)),
+                        DragPayload::Row(row_idx),
+                        |ui| {
+                            ui.label("⠿").on_hover_text("拖曳整行上下排序");
+                        },
+                    );
+
+                    let (zone, bar_drop) = ui.dnd_drop_zone::<DragPayload, ()>(Frame::new(), |ui| {
+                        ui.horizontal(|ui| {
+                            for (chip_idx, chip) in chips.iter().enumerate() {
+                                let chip_location = ChipLocation {
+                                    row: row_idx,
+                                    chip: chip_idx,
+                                };
+                                let chip_id =
+                                    egui::Id::unique(("shortcut_layout_chip", row_idx, chip_idx));
+
+                                let chip_response = ui
+                                    .dnd_drag_source(chip_id, DragPayload::Chip(chip_location), |ui| {
+                                        ui.label(chip);
+                                    })
+                                    .response;
+
+                                let rect = chip_response.rect;
+                                let pointer = ui.input(|i| i.pointer.interact_pos());
+                                let insert_chip_idx =
+                                    if pointer.is_some_and(|p| p.x < rect.center().x) {
+                                        chip_idx
+                                    } else {
+                                        chip_idx + 1
+                                    };
+
+                                // Preview insertion:
+                                if let (Some(pointer), Some(hovered_payload)) = (
+                                    pointer,
+                                    chip_response.dnd_hover_payload::<DragPayload>(),
+                                ) {
+                                    if let DragPayload::Chip(hovered_loc) = *hovered_payload {
+                                        let stroke = insertion_stroke(ui, 1.0);
+                                        if hovered_loc == chip_location {
+                                            // We are dragged onto ourselves
+                                            ui.painter().vline(rect.center().x, rect.y_range(), stroke);
+                                        } else if pointer.x < rect.center().x {
+                                            // Left of us
+                                            ui.painter().vline(rect.left(), rect.y_range(), stroke);
+                                        } else {
+                                            // Right of us
+                                            ui.painter().vline(rect.right(), rect.y_range(), stroke);
+                                        }
+                                    }
+                                }
+
+                                // Detect drops onto this chip:
+                                if let (Some(pointer), Some(dragged_payload)) =
+                                    (pointer, chip_response.dnd_release_payload())
+                                {
+                                    match *dragged_payload {
+                                        DragPayload::Chip(from_loc) => {
+                                            chip_from = Some(from_loc);
+                                            chip_to = Some(ChipLocation {
+                                                row: row_idx,
+                                                chip: insert_chip_idx,
+                                            });
+                                        }
+                                        DragPayload::Row(from_row) => {
+                                            // Row dropped on a chip:
+                                            // vertical insert above/below this row.
+                                            row_from = Some(from_row);
+                                            row_to = Some(if pointer.y < rect.center().y {
+                                                row_idx
+                                            } else {
+                                                row_idx + 1
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    });
+
+                    // Row-level preview: a horizontal line above/below the row.
+                    if let (Some(pointer), Some(hovered_payload)) = (
+                        ui.input(|i| i.pointer.interact_pos()),
+                        zone.response.dnd_hover_payload::<DragPayload>(),
+                    ) {
+                        if let DragPayload::Row(hovered_row) = *hovered_payload {
+                            let rect = zone.response.rect;
+                            let stroke = insertion_stroke(ui, 2.0);
+                            if hovered_row == row_idx {
+                                // We are dragged onto ourselves
+                                ui.painter().hline(rect.x_range(), rect.center().y, stroke);
+                            } else if pointer.y < rect.center().y {
+                                // Above us
+                                ui.painter().hline(rect.x_range(), rect.top(), stroke);
+                            } else {
+                                // Below us
+                                ui.painter().hline(rect.x_range(), rect.bottom(), stroke);
+                            }
+                        }
+                    }
+
+                    // Dropped on the row, but not on any one chip:
+                    if let Some(dragged_payload) = bar_drop {
+                        match *dragged_payload {
+                            DragPayload::Chip(from_loc) => {
+                                chip_from = Some(from_loc);
+                                chip_to = Some(ChipLocation {
+                                    row: row_idx,
+                                    chip: SHORTCUT_LAYOUT_END,
+                                });
+                            }
+                            DragPayload::Row(from_row) => {
+                                let y = ui
+                                    .input(|i| i.pointer.interact_pos())
+                                    .map_or(zone.response.rect.center().y, |p| p.y);
+                                row_from = Some(from_row);
+                                row_to = Some(if y < zone.response.rect.center().y {
+                                    row_idx
+                                } else {
+                                    row_idx + 1
+                                });
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    });
+
+    if let Some(dragged_payload) = empty_drop {
+        match *dragged_payload {
+            DragPayload::Row(from_row) => {
+                // Dropped onto empty space, but not on any row.
+                row_from = Some(from_row);
+                row_to = Some(SHORTCUT_LAYOUT_END);
+            }
+            DragPayload::Chip(from_loc) => {
+                chip_from = Some(from_loc);
+                chip_to = Some(ChipLocation {
+                    row: SHORTCUT_LAYOUT_END,
+                    chip: SHORTCUT_LAYOUT_END,
+                });
+            }
+        }
+    }
+
+    if let (Some(from), Some(to)) = (chip_from, chip_to) {
+        actions.push(UiAction::ShortcutLayoutMoveChip { from, to });
+    }
+
+    if let (Some(from), Some(to)) = (row_from, row_to) {
+        actions.push(UiAction::ShortcutLayoutMoveRow { from, to });
+    }
 }
 
 fn draw_settings(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
@@ -1746,6 +3249,15 @@ fn draw_settings(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction
                 if ui.checkbox(&mut enabled, "").changed() {
                     actions.push(UiAction::SetShortcutEnabled(Shortcut::Screenshot, enabled));
                 }
+            });
+            settings_row(ui, "終端台", |ui| {
+                let mut enabled = state.shortcut_console;
+                if ui.checkbox(&mut enabled, "").changed() {
+                    actions.push(UiAction::SetShortcutEnabled(Shortcut::Console, enabled));
+                }
+            });
+            settings_row(ui, "佈局", |ui| {
+                draw_shortcut_layout(ui, state, actions);
             });
         });
 
@@ -1779,26 +3291,23 @@ fn settings_row(ui: &mut egui::Ui, label: &str, add_value: impl FnOnce(&mut egui
 fn draw_bottom_bar(ui: &mut egui::Ui, state: &AppState) {
     let mut items: Vec<String> = Vec::new();
     if state.pid > 0 {
-        items.push(format!("行程: {} | {}", state.proc_name, state.pid));
+        items.push(format!("行程: {} | PID: {}", state.proc_name, state.pid));
     } else {
-        items.push("行程: -".to_string());
+        items.push("行程: - | PID: -".to_string());
     }
     if state.module_base != 0 {
         items.push(format!("基底位址: 0x{:x}", state.module_base));
     }
     if !state.maps.is_empty() {
-        let checked_bytes: u64 = state
-            .maps
-            .iter()
-            .zip(state.map_checked.iter())
-            .filter(|(_, checked)| **checked)
-            .map(|(m, _)| m.end - m.start)
-            .sum();
+        let (virtual_span, selected_count) = selected_map_totals(state);
         items.push(format!(
-            "映射: {} 個，共 {}",
-            state.maps.len(),
-            format_size(checked_bytes)
+            "映射{}個 | 共 {}",
+            selected_count,
+            format_size(virtual_span)
         ));
+    }
+    if let Some(scanned_bytes) = state.last_scan_bytes {
+        items.push(format!("本次掃描 {}", format_size(scanned_bytes)));
     }
     items.push(if state.driver_ok {
         "核心驅動已連接： RT-hook_ioctl".to_string()

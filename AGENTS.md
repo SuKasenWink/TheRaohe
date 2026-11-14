@@ -1,6 +1,18 @@
 # Repository Guidelines
 
+## Key Points
+1. 隱匿性至上, 存在更隱蔽的方法可選就必須選擇
+2. 協程 > 非同步線程
+3. 偏好原生樣式, 不覆寫
+
 ## Building and Testing
+
+```bash
+cargo xtask build --release    # 交叉編譯 aarch64-linux-android (自動偵測 NDK)
+cargo xtask deploy             # 打包 tar.gz (777, 二進位 + CopyToRelease/ 內容) -> adb push -> 覆蓋解壓到 /data/local/tmp/theraohe/ -> 執行
+cargo xtask deploy --restart   # 先 pkill theraohe 再部署(推薦)
+cargo check --target aarch64-linux-android
+```
 
 ## MCP
 - 自帶 MCP server, 綁 `127.0.0.1:8080`, 僅本機直連, 無認證
@@ -10,7 +22,10 @@
 
 ## Version Control
 此工作區使用 Git
-遠端儲存庫爲: https://github.com/SuKasenWink/TheRaohe
+
+必須以 hexsuen 的身份提交
+
+遠端儲存庫為: https://github.com/SuKasenWink/TheRaohe
 
 # Philosophy of Coding
 

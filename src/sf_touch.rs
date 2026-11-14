@@ -93,6 +93,7 @@ pub fn start(
                 }
             },
         };
+        crate::touch_targets::set_ranges(device.x_min, device.x_max, device.y_min, device.y_max);
         eprintln!(
             "[touch] device open: x={}..{} y={}..{}",
             device.x_min, device.x_max, device.y_min, device.y_max

@@ -3,14 +3,19 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod console;
 mod display;
 mod keyboard;
+mod lua_env;
+// 可選外掛: 刪除 src/mcp.rs 並移除此行與 mcp::start 呼叫即完成卸載; UI 不依賴此模組
 mod mcp;
+mod maps;
 mod mem;
 mod nb9;
 mod screenshot;
 mod sf_keys;
 mod sf_touch;
+mod touch_targets;
 mod ui;
 
 #[repr(C, align(16))]
@@ -220,6 +225,7 @@ struct FrameCtx<'a> {
     errors: u64,
     last_beat_time: Instant,
     last_beat_frames: u64,
+    last_map_retry: Instant,
     done: bool,
 }
 
@@ -254,6 +260,29 @@ impl FrameCtx<'_> {
     }
 
     unsafe fn render_frame(&mut self) {
+        // Lua Tick(): 每次垂直同步中斷都呼叫一次
+        if let Ok(mut state) = self.app.lock() {
+            // 附加成功(pid>0)但映射讀取失敗時, 反者掃描窗口結束後自動恢復, 否則 Lua 鏈路永久卡在 module
+            if state.pid > 0 && state.maps.is_empty()
+                && self.last_map_retry.elapsed() >= Duration::from_secs(2)
+            {
+                self.last_map_retry = Instant::now();
+                let new_maps = maps::read_maps(state.pid);
+                if !new_maps.is_empty() {
+                    state.map_checked = new_maps.iter().map(maps::default_map_checked).collect();
+                    state.maps = new_maps;
+                    state.module_base = maps::main_module(&state.maps);
+                    state.status.clear();
+                    crate::lua_env::set_module_index(&state.maps);
+                    eprintln!("[sf] maps 重試成功, 模組索引已重建");
+                }
+            }
+            crate::lua_env::set_target_info(state.pid, state.module_base);
+            for script in &mut state.lua_scripts {
+                crate::lua_env::call_tick(script);
+            }
+            ui::apply_lua_cmds(&mut state);
+        }
         self.sync_screen();
         let (cw, ch) = (self.args_w, self.args_h);
         if self.canvas_dims != (cw, ch) {
@@ -394,6 +423,7 @@ unsafe fn run_vsync(
         errors: 0,
         last_beat_time: started,
         last_beat_frames: 0,
+        last_map_retry: started,
         done: false,
     };
 
@@ -612,6 +642,8 @@ unsafe fn run(args: &Args) {
         );
     }
 
+    touch_targets::set_layer_offset(args.x, args.y);
+
     if args.touch {
         sf_touch::start(
             Arc::clone(&app),
@@ -632,6 +664,8 @@ unsafe fn run(args: &Args) {
 }
 
 fn main() {
+    // 首行執行, 截獲 stdout/stderr 供終端台窗口顯示
+    console::init();
     let args = parse_args();
     unsafe { run(&args) }
 }

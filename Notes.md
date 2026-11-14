@@ -1,150 +1,174 @@
-# 主窗口
-
-標題: "The Raohe"
-
-原生 egui 窗口應已支持大小拖拽
-
-## 前端繪製管線
-
-SurfaceView + HWC
-
-## 後端繪製管線
-
-3D 實用庫: glam(開啓 NEON)(未來會用於鏡頭投影2D 暫時沒用 可以先包含)
-
-GUI 及向量繪圖: egui(cpu) + epaint
-
-使用 AChoreographer 的 Callback 去重繪製 以貼齊螢幕刷新率繪製
-
-## UI
-
-偏好默認樣式
-
-只定義顏色和標題級別 絕不定義任何自定義樣式(圓角等)
-
-## 一級選單
-
-頂部橫向排列 左->右
-
-背景色用灰色, 跟內容區的純黑分開
-
-### 1. 行程
-
-按鈕項目流, 一項爲 "%名稱 | %PID", 左對齊
-
-頂部爲搜尋框, 置中對齊, 無需搜尋/清除按鈕, 就一個輸入框已夠用(因爲是即時模式)
-
-### 2. 映射
-
-用表格顯示 欄位爲 勾選框,位址範圍,大小(這爛右對齊),權限(字體色彩映射成 r 綠、w 黃、x 紅、- 灰),名稱
-
-不可掃描(例如 /dev/)的整條變灰並禁用複選排至底部
-
-### 3. 掃描
-
-#### 類型選擇及目標值
-
-類型選單在左邊
-
-選擇交互, 每個項目爲一個按鈕(即現有方案), Radio Mode, 按下彈起其它(不要用單選框 純粹是不太喜歡)
-
-1. Int32
-2. Int64
-3. Float32
-4. Double
-5. Boolean(獨立): 我知道4 bytes/Int也能掃 但 就是獨立一下吧
-6. Boolean(Bitfield)
-7. uint8
-8. 指標
-
-下面這些需要展開 Advanced:(egui::CollapsingHeader)
-
-1. Int16
-
-查找值輸入框位於右邊內容區頂部。按照類型變化, 例如指標就是文本輸入框, Boolean就是勾選框。樣式:
-
-查找目標值(<類型>): <符合搜尋類型的輸入框>
-
-#### 按變化篩選
-
-查找輸入框下面爲一堆依變化查找的按鈕:
-
-功能區標題: 按變化篩選
-
-1. 任意變化
-2. 原樣
-3. 任意增大
-4. 任意減少
-5. 增加了: <符合搜尋類型的輸入框>
-6. 減少了: <符合搜尋類型的輸入框>
-
-#### 底部
-
-內容區底部按鈕
-
-1. 篩選結果(初始是禁用 灰色的)
-2. 首次掃描/新一輪掃描
-
-### 結果(不是一級選單可選的獨立頁 實爲掃描頁的右邊部分)
-
-顯示在掃描控制頁的右邊/下邊(取決於窗口 Size)(類似分屏顯示)
-```rust
-egui::SidePanel::right("scan_panel")
-    .resizable(true)
-    .show(ctx, |ui| {
-        draw_scan_controls(ui, &mut state);
-    });
-
-egui::CentralPanel::default().show(ctx, |ui| {
-    draw_results(ui, &mut state);
-});
+From UC:
+```c
+const DWORD CurrentWeapon = 0x2C34;
+const DWORD STExtraBaseCharacter = 0x29F8;
+const DWORD GameState = 0x428;
+const DWORD bNoAliveHumanPlayer = 0xB64;
+const DWORD AlivePlayerNum = 0xBD4;
+const DWORD ElapsedTime = 0x500;
+const DWORD NoneAIGameTime = 0xBDC;
+const DWORD PlayerNum = 0x818;
+const DWORD RealPlayerNum = 0xAB0;
+const DWORD RealPlayerNums = 0xAB0;
+const DWORD AliveTeamNum = 0xBD8;
+const DWORD PlayerNumPerTeam = 0xFAC;
+const DWORD GameModeID = 0x1118;
+const DWORD CurCircleWave = 0xB60;
+const DWORD GameReplayType = 0xA1C;
+const DWORD PersistentLevel = 0x30;
+const DWORD NetDriver = 0x38;
+const DWORD ServerConnection = 0x78;
+const DWORD PlayerController = 0x30;
+const DWORD AcknowledgedPawn = 0x528;
+const DWORD RootComponent = 0x208;
+const DWORD CurrentStates = 0x1070;
+const DWORD LastUpdateVelocity = 0x330;
+const DWORD TeamId = 0x9A8;
+const DWORD IsBot = 0xA69;
+const DWORD Name = 0x960;
+const DWORD Nation = 0x970;
+const DWORD IsDead = 0xE8C;
+const DWORD PlayerUID = 0x998;
+const DWORD Health = 0xE70;
+const DWORD HealthMax = 0xE74;
+const DWORD NearDeathBreath = 0x1CB0;
+const DWORD NearDeatchComponent = 0x1C98;
+const DWORD BreathMax = 0x1CC;
+const DWORD ControlRotation = 0x4E0;
+const DWORD ComponentVelocity = 0x2C0;
+const DWORD CurrentVehicle = 0xEC0;
+const DWORD ReplicatedMovement = 0x110;
+const DWORD RelativeLocation = 0x1E4;
+const DWORD RelativeRotation = 0x1F0;
+const DWORD Mesh = 0x510;
+const DWORD BodyAddv = 0x20C;
+const DWORD MinLOD = 0xA2C;
+const DWORD CachedComponentSpaceTransforms = 0xCE0;
+const DWORD CachedBoneSpaceTransforms = 0xCD0;
+const DWORD CurrentWeaponReplicated = 0x5E8;
+const DWORD WeaponManagerComponent = 0x2768;
+const DWORD BulletTrackDistance = 0x940;
+const DWORD CurrentReloadWeapon = 0x3388;
+const DWORD PredictLineComp = 0x30D8;
+const DWORD WeaponPredictLine = 0x860;
+const DWORD PredictLineColor = 0xC68;
+const DWORD PredictResult = 0xCD0;
+const DWORD PredictResult_PathData = 0x0;
+const DWORD PredictResult_LastTraceDest = 0x10;
+const DWORD PredictResult_HitResult = 0x30;
+const DWORD HitResult_bBlockingHit = 0x0;
+const DWORD HitResult_Location = 0xC;
+const DWORD HitResult_ImpactPoint = 0x18;
+const DWORD HitResult_ImpactNormal = 0x30;
+const DWORD PredictPathPointStride = 0x1C;
+const DWORD PredictPathPoint_Velocity = 0xC;
+const DWORD SplineInfo = 0xA28;
+const DWORD InterpCurvePointStride = 0x1C;
+const DWORD InterpCurvePoint_OutVal = 0x4;
+const DWORD PredictProjectilePathParams = 0xB90;
+const DWORD PredictParams_StartLocation = 0x0;
+const DWORD PredictParams_LaunchAcceleration = 0x18;
+const DWORD PredictParams_ProjectileRadius = 0x28;
+const DWORD PredictParams_MaxSimTime = 0x2C;
+const DWORD PredictParams_SimFrequency = 0x58;
+const DWORD PredictParams_OverrideGravityZ = 0x5C;
+const DWORD PredictParams_GravityScale = 0x60;
+const DWORD PredictLineRedrawCounter = 0xDB8;
+const DWORD SceneComp_VisFlags = 0x2DC;
+const DWORD ActorBlueprintCreatedComponents = 0x400;
+const DWORD ActorChildren = 0x1F8;
+const DWORD ActorInstigator = 0x1F0;
+const DWORD GrenadePredictResult = 0x4D0;
+const DWORD GrenadePredictIsHitActor = 0x10;
+const DWORD GrenadePredictHitActorLocation = 0x14;
+const DWORD GrenadePredictLine_MaxSimTime = 0x4CC;
+const DWORD GrenadePredictLine_GrenadeRadius = 0x500;
+const DWORD ThrowComp_NewProjectile = 0x2F0;
+const DWORD EliteProjectileMovement = 0x578;
+const DWORD EliteProjectileRepMovement = 0x600;
+const DWORD EliteProjectileMaxBounces = 0x250;
+const DWORD ProjectileGravityScale = 0x1D4;
+const DWORD ProjectileBounciness = 0x1DC;
+const DWORD ProjectileFriction = 0x1E0;
+const DWORD ProjectileStopSpeed = 0x1E4;
+const DWORD ProjectileBounceFlags = 0x1C0;
+const DWORD ProjectileMaxSimTimeStep = 0x214;
+const DWORD WorldGravityZ = 0x4F8;
+const DWORD ShootWeaponComponent = 0xFB0;
+const DWORD OwnerShootWeapon = 0x2D0;
+const DWORD CurBulletNumInClip = 0x8;
+const DWORD CurMaxBulletNumInOneClip = 0x1050;
+const DWORD ShootWeaponEntity = 0x13B8;
+const DWORD ShootWeaponEffectComp = 0x13C0;
+const DWORD CameraShakeInnerRadius = 0x2E8;
+const DWORD CameraShakeOuterRadius = 0x234;
+const DWORD CameraShakFalloff = 0x2F0;
+const DWORD CharacterOverrideAttrs = 0x1570;
+const DWORD BulletFireSpeed = 0x570;
+const DWORD BulletMomentum = 0x6E4;
+const DWORD BulletRange = 0x6F4;
+const DWORD BaseImpactDamage = 0x6D4;
+const DWORD VehicleDamageScale = 0x6E0;
+const DWORD LaunchGravityScale = 0x5D8;
+const DWORD ShootInterval = 0x5B0;
+const DWORD bHasSingleFireMode = 0x610;
+const DWORD bHasAutoFireMode = 0x611;
+const DWORD bHasBurstFireMode = 0x612;
+const DWORD BurstShootInterval = 0x650;
+const DWORD ReloadRate = 0x988;
+const DWORD AccessoriesVRecoilFactor = 0xBF8;
+const DWORD AccessoriesHRecoilFactor = 0xC00;
+const DWORD AccessoriesRecoveryFactor = 0xBFC;
+const DWORD ShotGunCenterPerc = 0xC64;
+const DWORD ShotGunVerticalSpread = 0xC68;
+const DWORD ShotGunHorizontalSpread = 0xC6C;
+const DWORD GameDeviationFactor = 0xC5C;
+const DWORD GameDeviationAccuracy = 0xC60;
+const DWORD AccessoriesDeviationFactor = 0xC20;
+const DWORD VehicleWeaponDeviationAngle = 0xC7C;
+const DWORD RecoilKickADS = 0xD20;
+const DWORD HP = 0x354;
+const DWORD HPMax = 0x350;
+const DWORD Fuel = 0x43C;
+const DWORD FuelMax = 0x438;
+const DWORD VehicleMovement = 0x1E50;
+const DWORD VehicleCommon = 0xC08;
+const DWORD lastForwardSpeed = 0xCD0;
+const DWORD PickUpDataList = 0x968;
+const DWORD bIsInAirDropBox = 0x618;
+const DWORD STPlayerController = 0x4CF8;
+const DWORD PlayerCameraManager = 0x548;
+const DWORD CameraCache = 0x520;
+const DWORD CurrentCameraFOV = 0x2B14;
+const DWORD ScopeFov = 0x1DAC;
+const DWORD ScopeCameraComp = 0x1E18;
+const DWORD IsFPPGameMode = 0xA38;
+const DWORD SwitchWeaponSpeedScale = 0x2D9C;
+const DWORD CharacterParachuteComponent = 0x1898;
+const DWORD CurrentFallSpeed = 0x230;
+const DWORD Position = 0x21C;
+const DWORD CharacterMovement = 0x518;
+const DWORD SpringArmComp = 0x1DE8;
+const DWORD MeshContainer = 0x1C28;
+const DWORD STPlayerController1 = 0x4CF8;
+const DWORD HitPerform = 0x618;
+const DWORD bIsEngineStarted = 0xBC8;
+const DWORD ExtraBoostFactor = 0x20A4;
+const DWORD Status = 0x4D0;
+const DWORD RelativeScale3D = 0x1FC;
+const DWORD ShootWeaponEntityComp = 0x13B8;
+const DWORD STCharacterMovement = 0x1F28;
+const DWORD bIsFPPOnVehicle = 0x180C;
+const DWORD IsNetFPP = 0x2268;
+const DWORD IsGameModeFpp = 0xA00;
+const DWORD GameModeState = 0xB78;
+const DWORD IsCanSwitchFPP = 0xA39;
+const DWORD bIsGunADS = 0x114C;
+const DWORD bIsAirOpen = 0x728;
+const DWORD Kills = 0x720;
+const DWORD bIsWeaponFiring = 0x18B0;
+const DWORD AvatarComponent2 = 0x30E0;
+const DWORD SynData = 0x828;
+const DWORD NetAvatarData = 0x440;
+const DWORD ServerZoneId = 0x994;
 ```
-
-用表格展示 欄位是 位址,記憶體原始內容,解析值
-
-單擊複製該項
-
-不能全部資料都加載在 UI, 如果搜到百萬級的結果就崩了, 創建一個內容流拖拽懶加載
-```rust
-body.rows(18.0, total, |mut row| {
-    let hit = source.get(row.index()); // 只對可見行執行
-    // row.col(...) 畫該行
-});
-```
-
-
-### 5. 設置
-
-這裡是放跨工作區共用的配置的地方
-
-目前沒什麼能配置的。配置下 MCP 端口吧
-
-內容流樣式:
-
-區標題
-項目(左對齊) 值(右對齊)
-
-## 底欄
-
-一條用於顯示常駐(是放非即時的 即時例子如掃描的進度 那太快了 不放這裡)狀態的文本式 Bar. 每個項目獨立一個水平框位。空間不夠就換行(以項目爲單位換行)
-
-eg.: "行程: adbd","基底位址: 0x1234","核心驅動已連線✓","MCP http://localhost:xxxx"
-
-## 運算中的旋轉圈
-
-依序循環播放(90ms=1Tick):"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"
-
-
-
-# 實作建議(真的只是建議 有任何顧慮可以跟我溝通 一起決策)
-
-## 觸控檢測
-
-1. 非阻塞盲開： 把 event0 到 event15 統統打開，誰開失敗就踢掉。
-2. 核心休眠監聽： 用 poll 把所有 fd 託管給 Linux 核心，執行緒直接休眠（0% CPU），等使用者摸螢幕。
-3. 留贏家關輸家： 使用者觸摸時核心喚醒 poll，誰先讀出資料誰就是觸控螢幕。程式用 std::mem::forget 永久保留這個 fd，其餘的利用 Rust RAII 機制自動 Drop 關閉。
-
-## 工作區概念
-
-每個行程是一個工作區
-(暫時先不用實作工作區)

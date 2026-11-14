@@ -1,3 +1,6 @@
+[workspace]
+members = ["xtask"]
+
 [package]
 name = "theraohe"
 version = "0.1.0"
@@ -10,12 +13,18 @@ path = "src/theraohe.rs"
 
 [dependencies]
 libc = "0.2"
+xxhash-rust = { version = "0.8.19", default-features = false, features = ["xxh3"] }
 egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
 egui_software_backend = { package = "hdrshot-egui-backend", version = "0.2.0" }
 glam = "0.29"
 egui_extras = "0.37.0"
 png = "0.17"
-serde_json = "1"
+rmcp = { version = "3.9.0", default-features = false, features = ["macros", "server", "transport-streamable-http-server"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+serde = { version = "1.0.229", features = ["derive"] }
+schemars = "1.2.3"
+mlua = { version = "0.12", default-features = false, features = ["lua54", "vendored", "send"] }
 
 [profile.release]
 opt-level = "z"
