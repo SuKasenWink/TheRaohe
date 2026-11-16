@@ -4,7 +4,7 @@
 
 enabled = true
 speed = 1
-name = "theraohe"
+name = ""
 
 function hello()
     print("hello from lua")

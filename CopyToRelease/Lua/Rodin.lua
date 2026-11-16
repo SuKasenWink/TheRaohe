@@ -8,9 +8,10 @@
 -- 修復原則: 位置/旋轉/FOV 必須從同一個 CameraCache POV 讀, 渲染什麼就投影什麼
 -- FOV: 實際渲染 FOV 在 CameraCache POV (pcm+0x554): 腰射 80.0, 開鏡 lerp 到武器倍率; ctrl+0x2B14 只是基礎 FOV, 不採用
 -- 敵人列舉: 關卡 Actors TArray (GWorld +0x30 PersistentLevel -> +0xA0 Data, +0xA8 Num);
---   所有角色 (玩家與 AI 靶人) 都是同一個 STExtraBaseCharacter 類, 以 onself 的 vtable 識別;
+--   以角色標記 (STExtraBaseCharacter) 篩選: actor+0x2CD8 == 479.5f (C++ 源碼鏈);
 --   再讀 RootComponent +0x208 -> RelativeLocation +0x1E4 得世界座標
--- 自身跳過; 死亡 (bDead +0xE8C) 與隊友 (TeamID +0x9A8) 跳過; 人機 (IsBot +0xA69) 畫灰線, 真人畫紅線
+-- 自身跳過; 死亡 (State +0x1070, 命中 {262144,262152,1048576,1048592}) 與隊友 (TeamID +0x9A8) 跳過;
+--   TeamID<=0 跳過; 人機 (0xA50/0xA51/0xA52/0xA69 任一非 0) 畫灰線, 真人畫紅線
 --
 -- Aimbot (aim 模組): 配置為捷徑後與遊戲開火鍵重疊; 短捷徑只是「影響器」, 實際自瞄邏輯都在 Tick 內處理
 --   走訪所有可見敵人 → 取螢幕中心距離最近者 → 已快取目標: 直接追蹤滑動
@@ -18,7 +19,9 @@
 --   (enemies 全詳細計算只算一次, ESP 與 aim 模組共用)
 --   接獲/失去目標的判定只在「非快取目標」時進行; 快取目標只要使用者不鬆開捷徑就一直自瞄
 --   倍率 Y=0 = 只水平 (用戶自行壓槍), X 依舊照常工作
---   自瞄手指固定 slot 9, 與使用者手指不競爭; 使用者放手 (整個 Tick 缺席) 時下一幀抬手指
+--   自瞄手指固定 slot 9, 連點手指固定 slot 8 (FullyAutoTrigger / AutoTrigger用), 與使用者手指不競爭; 使用者放手 (整個 Tick 缺席) 時下一幀抬手指
+--   Aimbot_Pressing(x, y): x,y = 捷徑按下時手指的屏幕物理像素 (左上原點); 直接落點快取, 供FullyAutoTrigger/AutoTrigger共用; 無 xy 則落點清空
+--   AutoTrigger(): 開關式函式 (回 Bool), 捷徑呈按鈕開關; 目標點對準相機 Forward 軸線即自動進入連點循環 (Aimbot 未按下才生效)
 local module_candidates = { "libue4.so", "UE4", "Unreal", "Game", "PUBGM" }
 
 local CTRL_PATTERN = '[[[[[["%s"+0xFC70A70]+0x810]+0x78]+0x38]+0x78]+0x30]'
@@ -26,35 +29,75 @@ local ONSELF_PATTERN = '[[[[[[["%s"+0xFC70A70]+0x810]+0x78]+0x38]+0x78]+0x30]+0x
 local GWORLD_PATTERN = '[[["%s"+0xFC70A70]+0x810]+0x78]'
 
 local TEAM_ID_OFF = 0x9a8
-local B_DEAD_OFF = 0xe8c
+-- 死亡判定: State (actor+0x1070) int; 命中即視為死亡/盒; 任意讀不到即保留
+local STATE_OFF = 0x1070
+local DEAD_STATES = {
+    [262144] = true, [262152] = true, [1048576] = true, [1048592] = true,
+}
+local function is_dead_state(s)
+    return s ~= nil and DEAD_STATES[s] == true
+end
+-- 角色標記: 玩家 pawn 為 479.5f (stextrabasecharacter 共有常量), 區分 STExtraBaseCharacter AI 與絕大部分載具/物資
+local PLAYER_MARK_OFF = 0x2cd8
+local PLAYER_MARK = 479.5
+-- IsBot: 多個候選 byte 任一非 0 即人機
 local IS_BOT_OFF = 0xa69
+local BOT_OFF_50 = 0xa50
+local BOT_OFF_51 = 0xa51
+local BOT_OFF_52 = 0xa52
+local function is_bot_flag(actor)
+    local b = theraohe.read_u8(actor + IS_BOT_OFF) or 0
+    if b ~= 0 then return true end
+    b = theraohe.read_u8(actor + BOT_OFF_50) or 0
+    if b ~= 0 then return true end
+    b = theraohe.read_u8(actor + BOT_OFF_51) or 0
+    if b ~= 0 then return true end
+    b = theraohe.read_u8(actor + BOT_OFF_52) or 0
+    return b ~= 0
+end
 -- RootComponent 內: RelativeLocation +0x1E4, RelativeRotation +0x1F0 (FRotator, 角度)
 local RELATIVE_ROTATION_OFF = 0x1f0
--- SkeletalMeshComponent: STCharacter -> Mesh +0x510; TArray<FTransform> 偏移由本 build 實測 (tick 1 掃描確認 67 骨, MCS 頭 z 遞增)
 local MESH_OFF = 0x510
+-- 引擎每幀維護的 ComponentToWorld FTransform (inline, mesh+0x210; 與 C++ 專案 pubg 模式一致)
+local COMPONENT_TO_WORLD_OFF = 0x210
+-- mesh+0xA30 內聯 TArray<FTransform> (bone component-space, 骨索引索引 48B FTransform), Num @ +0xA38,
+--   實際元素起始在 Data+0x30 (C++ 解法把該跳過首元素 48B)
 local CACHED_COMPONENT_SPACE_OFF = 0xa30
-local CACHED_BONE_SPACE_OFF = 0xc98
--- UE4 FTransform (FQuat 對齊 16B): Rotation 0x00(f32x4), Translation 0x10(f32x3), Scale3D 0x1C, SizeOf=48
+local BONES_DATA_BIAS = 0x30
 local FTRANSFORM_SIZE = 48
-local MAX_BONES = 2048
--- pubgm 人形骨架 MCS 局部 z 以腳為原點; 根膠囊中心則在髖部 (root z), 二者高度差寫死
-local PUBGM_CAPSULE_HALF = 85.0
--- 骨鏈僅繪製斷點長度 >= 閾值的線段 (短骨如手指不顯示)
-local BONE_MIN_LINK_CM = 10.0
+-- 姿勢骨索引 (與 C++ 專案 pubg 模式一致): 頭/胸/盆/左肩/右肩/左肘/右肘/左腕/右腕/左大腿/右大腿/左膝/右膝/左踝/右踝
+local BONE_TABLE_STANDARD = { 5, 4, 1, 11, 32, 12, 33, 63, 62, 52, 56, 53, 57, 54, 58 }
+local BONE_TABLE_68 = { 5, 4, 1, 11, 33, 12, 34, 13, 35, 55, 59, 56, 60, 57, 61 }
 
--- 全域: 高亮骨骼索引, 橙線渲染; <0 = 不高亮。TheRaohe Lua 頁面可調 (公共整型變量); 6 = 自瞄骨頭
-HighlightBone = 6
+-- 自瞄 (Lua 頁面公開)
+-- AimbotBone (0-based, 15 項繪製表順序: 頭=0 ... 右踝=14), 橙色連線; <0 = 不高亮。
+-- 繪製高亮與自瞄追蹤共用; 0 = 頭 (C++ 專案預設自瞄部位)
+AimbotBone = 0
 -- 自瞄手指與行為 (Lua 頁面公開, 物理像素座標)
 -- 手指起手位: 該處有空白遊戲區域最佳; 會自動鉗位到螢幕內
 AimbotStartX = 2000
 AimbotStartY = 200
--- 滑動倍率 (螢幕中心-敵人位置差 * 倍率 = 滑動距離); 涵蓋速度與鏡頭靈敏度
+-- AimbotMultiplier (螢幕中心-敵人位置差 * 倍率 = 滑動距離); 涵蓋速度與鏡頭靈敏度
 -- Y=0 = 只水平瞄準 (自行壓槍), X 仍照常工作
 AimbotMultiplierX = 0.05
 AimbotMultiplierY = 0.0
+-- 單次滑動像素上限: 本次 dx,dy 合向量超過此值則忽略本幀滑動 (手指不落/不動), 每次忽略 print; <=0 = 不限制
+AimbotMaxDrag = 0
 -- 畫自瞄用立方體 MinMax 包圍盒 (黃框, 所有可見敵人); ShowCenterCross 畫螢幕中心十字 (綠)
 ShowAimbotRect = true
 ShowCenterCross = true
+-- 開火 (Lua 頁面公開): 與捷徑同按, 在 Aimbot_Pressing 收到的位置循環 按下→間隙→鬆開
+-- 連點手指固定 slot 8; 預設間隙 50ms; FireGap同時用於AutoTrigger
+FullyAutoTrigger = false
+FireGap = 0.05
+-- AutoTrigger閥值: 瞄準目標點到相機 Forward 軸線之垂距小於此值 (cm) 即進入連點循環 (30cm 實測值)
+AutoTriggerThreshold = 30
+-- 雷達 (Lua 頁面公開): Yaw 跟隨雷達 — 中心=自己 (相機 POV 位置), 上=相機視角 Yaw; 把敵人 world 映射到正方形上
+-- 雷達位置 (螢幕物理像素, 中心對齊): 預設 800,350; 尺寸=單邊 px (預設 350); 範圍=單邊對應世界長度 (米, 預設 240 → ±120m)
+RadarPosX = 800
+RadarPosY = 350
+RadarSize = 350
+RadarRange = 240
 
 -- 自瞄內部狀態 (不反射)
 local aim_finger_down = false   -- 自瞄手指是否已落下
@@ -62,6 +105,13 @@ local aim_x, aim_y = nil, nil   -- 自瞄手指當前位置; nil = 未落下
 local aim_target = nil          -- 已快取自瞄目標 (actor ptr 整數)
 local aim_last_call = -1        -- 最後一次 Aimbot_Pressing 的 tick 序號; 使用者放手時 => ticks 跳號
 local aim_requested = false     -- 捷徑按住狀態 (影響器); 實際自瞄邏輯在 Tick 的 aim 模組執行
+local aim_press_x, aim_press_y = nil, nil  -- 捷徑按下的位置 (物理像素); 不帶則 Aimbot_Pressing 無 xy
+-- FullyAutoTrigger內部狀態 (不反射)
+local fire_finger_down = false
+local fire_down_at = 0.0        -- 本次按下的時刻 (theraohe.now())
+local fire_x, fire_y = nil, nil -- 本次按下的位置
+-- AutoTrigger開關 (不反射); AutoTrigger 函式點擊翻轉並回傳, 捷徑將其渲染為開關式按鈕; 默認關; 需先按一次捷徑播種落點
+local autotrigger_on = false
 
 local ticks = 0
 
@@ -81,6 +131,21 @@ function Begin()
 end
 
 local DEG = math.pi / 180
+
+-- 無分支 HSV→RGB (s=v=1, clamp 三角波); 於 25 個整數值繞色環一圈
+-- n 任意整數; Lua % 對負數回非負
+local floor, abs = math.floor, math.abs
+local min, max = math.min, math.max
+local function channel(h, offset)
+    return min(1, max(0, abs(((h + offset) % 1) * 6 - 3) - 1))
+end
+local function int_to_rgb(n)
+    local h = ((n - 1) % 25) / 25
+    local r = channel(h, 0)
+    local g = channel(h, -1/3)
+    local b = channel(h, -2/3)
+    return floor(r * 255 + 0.5), floor(g * 255 + 0.5), floor(b * 255 + 0.5)
+end
 
 -- FRotator (角度) → 行向量基底; UE4 世界: X 前 Y 右 Z 上
 local function rotator_axes(pitch, yaw, roll)
@@ -145,6 +210,12 @@ local BOX_EDGES = {
     { 1, 3 }, { 3, 7 }, { 7, 5 }, { 5, 1 },
     { 2, 4 }, { 4, 8 }, { 8, 6 }, { 6, 2 },
 }
+-- 15 姿勢骨連線: 頭-胸-盆 / 胸-肩-肘-腕 / 盆-大腿-膝-踝 (與 C++ 專案 pubg 模式一致)
+local LIMB_PAIRS = {
+    { 1, 2 }, { 2, 3 },
+    { 2, 4 }, { 2, 5 }, { 4, 6 }, { 5, 7 }, { 6, 8 }, { 7, 9 },
+    { 3, 10 }, { 3, 11 }, { 10, 12 }, { 11, 13 }, { 12, 14 }, { 13, 15 },
+}
 local CAP_STUB_CM = 15.0
 
 local function cube_corners(VP, x, y, z, pitch, yaw, roll, sx, sy, sz, sw, sh)
@@ -192,231 +263,79 @@ local function draw_minmax_rect(min_x, min_y, max_x, max_y, r, g, b, a)
     theraohe.draw_line(min_x, max_y, min_x, min_y, r, g, b, a)
 end
 
--- 小端 f32 解碼; o 為 0 基字節偏移
-local function f32_at(s, o)
-    local b1, b2, b3, b4 = string.byte(s, o + 1, o + 4)
-    local bits = ((b4 << 24) | (b3 << 16) | (b2 << 8) | b1) & 0xFFFFFFFF
-    local sign = (bits >> 31) ~= 0 and -1.0 or 1.0
-    local exp = (bits >> 23) & 0xFF
-    local mant = bits & 0x007FFFFF
-    if exp == 0 then
-        return sign * math.ldexp(mant, -126 - 23)
-    elseif exp == 255 then
-        return sign * math.huge
-    end
-    return sign * math.ldexp(1.0 + mant * 2.0 ^ -23, exp - 127)
-end
-
--- 讀整段陣列 (4096 上限分塊), 失敗回 nil
-local function read_chunks(addr, len)
-    local parts = {}
-    local off = 0
-    while off < len do
-        local chunk = math.min(len - off, 4096)
-        local s = theraohe.read_bytes(addr + off, chunk)
-        if not s or #s ~= chunk then
-            return nil
-        end
-        parts[#parts + 1] = s
-        off = off + chunk
-    end
-    return table.concat(parts)
-end
-
--- TArray<FTransform> -> { quat(x,y,z,w), trans(x,y,z) }[1..num]
-local function decode_transforms(addr, num)
-    local blob = read_chunks(addr, num * FTRANSFORM_SIZE)
-    if not blob then
-        return nil
-    end
-    local out = {}
-    for i = 1, num do
-        local base = (i - 1) * FTRANSFORM_SIZE
-        out[i] = {
-            qx = f32_at(blob, base + 0),
-            qy = f32_at(blob, base + 4),
-            qz = f32_at(blob, base + 8),
-            qw = f32_at(blob, base + 12),
-            tx = f32_at(blob, base + 16),
-            ty = f32_at(blob, base + 20),
-            tz = f32_at(blob, base + 24),
-        }
-    end
-    return out
-end
-
--- 只解碼指定骨 (烘焙後用): 只取 translation, 跳過 quat/scale
-local function decode_kept(addr, num, keep)
-    local blob = read_chunks(addr, num * FTRANSFORM_SIZE)
-    if not blob then
-        return nil
-    end
-    local out = {}
-    for i = 1, num do
-        if keep[i] then
-            local base = (i - 1) * FTRANSFORM_SIZE
-            out[i] = {
-                tx = f32_at(blob, base + 16),
-                ty = f32_at(blob, base + 20),
-                tz = f32_at(blob, base + 24),
-            }
-        end
-    end
-    return out
-end
-
-local function qmul(ax, ay, az, aw, bx, by, bz, bw)
-    return aw * bx + ax * bw + ay * bz - az * by,
-           aw * by - ax * bz + ay * bw + az * bx,
-           aw * bz + ax * by - ay * bx + az * bw,
-           aw * bw - ax * bx - ay * by - az * bz
-end
-
-local function qrot(qx, qy, qz, qw, vx, vy, vz)
-    local tx = 2.0 * (qy * vz - qz * vy)
-    local ty = 2.0 * (qz * vx - qx * vz)
-    local tz = 2.0 * (qx * vy - qy * vx)
-    return vx + qw * tx + qy * tz - qz * ty,
-           vy + qw * ty + qz * tx - qx * tz,
-           vz + qw * tz + qx * ty - qy * tx
-end
-
-local function qdot_abs(ax, ay, az, aw, bx, by, bz, bw)
-    return math.abs(ax * bx + ay * by + az * bz + aw * bw)
-end
-
--- 父骨還原 + 骨絡烘焙: 首次對該骨架 (num) 建一次
---   1. MCS[i] 應等於 MCS[p] * BS[i] (旋轉 Hamilton 積, 平移 p.t + p.rot*bs.t); 不匹配即放棄
---   2. 依當前姿勢斷點長度標記需要解碼/投影的骨骼 (>= BONE_MIN_LINK_CM): 兩端同記, 烘焙後
---      該 num 的後續幀直接跳過短骨鏈 (指/腕等), 不受運動時斷點長度<=閾值的影響
--- 不依賴骨骼名字/父索引佈局, PUBGM 骨架任意版本可重建; 按 num 緩存, 一局只算一次。
-local skeleton_cache = {}
-local function bake_skeleton(num, mcs, bs)
-    local cached = skeleton_cache[num]
-    if cached then
-        return cached
-    end
-    local parents = {}
-    for i = 2, num do
-        local bi = bs[i]
-        local qi = mcs[i]
-        local best, best_d2
-        for p = 1, i - 1 do
-            local pi = mcs[p]
-            local dx = bi.tx
-            local dy = bi.ty
-            local dz = bi.tz
-            local rx, ry, rz = qrot(pi.qx, pi.qy, pi.qz, pi.qw, dx, dy, dz)
-            local ddx = pi.tx + rx - qi.tx
-            local ddy = pi.ty + ry - qi.ty
-            local ddz = pi.tz + rz - qi.tz
-            local d2 = ddx * ddx + ddy * ddy + ddz * ddz
-            if d2 < 25.0 and (best_d2 == nil or d2 < best_d2) then
-                local cx, cy, cz, cw = qmul(pi.qx, pi.qy, pi.qz, pi.qw, bi.qx, bi.qy, bi.qz, bi.qw)
-                if qdot_abs(cx, cy, cz, cw, qi.qx, qi.qy, qi.qz, qi.qw) > 0.999 then
-                    best, best_d2 = p, d2
-                end
-            end
-        end
-        parents[i] = best
-    end
-    local min2 = BONE_MIN_LINK_CM * BONE_MIN_LINK_CM
-    local keep = {}
-    for i = 2, num do
-        local pi = parents[i]
-        if pi then
-            local dx = mcs[i].tx - mcs[pi].tx
-            local dy = mcs[i].ty - mcs[pi].ty
-            local dz = mcs[i].tz - mcs[pi].tz
-            if dx * dx + dy * dy + dz * dz >= min2 then
-                keep[i] = true
-                keep[pi] = true
-            end
-        end
-    end
-    local out = { parents = parents, keep = keep }
-    skeleton_cache[num] = out
-    return out
-end
-
--- mesh 骨架 → 世界 2D 投影: 組件空間骨位置先旋轉入人物局部座標系, 再投影
--- 回傳 { num, sxs, sys, parents, keep }; sxs/sys 被過濾的骨為 nil; 失敗或無骨回 nil
+-- mesh 骨架 → 世界 2D 投影 (C++ 專案 pubg 模式解法):
+--   mesh+0x210 inline ComponentToWorld FTransform → 4x4 矩陣;
+--   bone 矩陣沿 c2w 旋轉部分旋轉 + 平移相加 (World = BoneLocal * c2w), 再投影;
+--   僅投 15 姿勢骨 (頭/胸/盆/四肢), 索引用靜態表 (==68 → b68 表; 其餘 standard; 最大索引 ≥ num 即不認識, 不畫骨)
+--   回傳 { num = 15, sxs, sys }; 槽位 1..15; 失敗 (讀不到 / 版本佈局不認識) 回 nil
 local function mesh_bone_screen(VP, actor, x, y, z, rpitch, ryaw, rroll, sw, sh)
     local mesh = theraohe.read_u64(actor + MESH_OFF)
     if not mesh or mesh == 0 then
         return nil
     end
-    local mcs_data = theraohe.read_u64(mesh + CACHED_COMPONENT_SPACE_OFF)
+    -- c2w: 內聯 FTransform (Rotation quat + Translation + chunk + Scale3D) → 矩陣 (與 C++ TransformToMatrix 一致)
+    local qx = theraohe.read_f32(mesh + COMPONENT_TO_WORLD_OFF)
+    local qy = theraohe.read_f32(mesh + COMPONENT_TO_WORLD_OFF + 4)
+    local qz = theraohe.read_f32(mesh + COMPONENT_TO_WORLD_OFF + 8)
+    local qw = theraohe.read_f32(mesh + COMPONENT_TO_WORLD_OFF + 12)
+    local tx = theraohe.read_f32(mesh + COMPONENT_TO_WORLD_OFF + 16)
+    local ty = theraohe.read_f32(mesh + COMPONENT_TO_WORLD_OFF + 20)
+    local tz = theraohe.read_f32(mesh + COMPONENT_TO_WORLD_OFF + 24)
+    local sx = theraohe.read_f32(mesh + COMPONENT_TO_WORLD_OFF + 32)
+    local sy = theraohe.read_f32(mesh + COMPONENT_TO_WORLD_OFF + 36)
+    local sz = theraohe.read_f32(mesh + COMPONENT_TO_WORLD_OFF + 40)
+    if not (qx and qy and qz and qw and tx and ty and tz and sx and sy and sz) then
+        return nil
+    end
+    local x2, y2, z2 = qx + qx, qy + qy, qz + qz
+    local xx2, yy2, zz2 = qx * x2, qy * y2, qz * z2
+    local yz2, wx2 = qy * z2, qw * x2
+    local xy2, wz2 = qx * y2, qw * z2
+    local xz2, wy2 = qx * z2, qw * y2
+    -- c2w 旋轉部分 (含 Scale3D), 平移
+    local c11, c12, c13 = (1 - (yy2 + zz2)) * sx, (xy2 + wz2) * sx, (xz2 - wy2) * sx
+    local c21, c22, c23 = (xy2 - wz2) * sy, (1 - (xx2 + zz2)) * sy, (yz2 + wx2) * sy
+    local c31, c32, c33 = (xz2 + wy2) * sz, (yz2 - wx2) * sz, (1 - (xx2 + yy2)) * sz
+    -- bone component-space: mesh+0xA30 TArray; 實際起點 Data + 0x30 (C++ 解法)
+    local bone_data = (theraohe.read_u64(mesh + CACHED_COMPONENT_SPACE_OFF) or 0) + BONES_DATA_BIAS
     local num = theraohe.read_u32(mesh + CACHED_COMPONENT_SPACE_OFF + 8)
-    if not mcs_data or mcs_data == 0 or not num or num < 2 or num > MAX_BONES then
+    if bone_data == 0 or not num or num < 1 or num > 256 then
         return nil
     end
-    -- 骨絡烘焙 (父骨 + 需要解碼的骨): 首次需要 BS, 之後直接取緩存
-    local skel = skeleton_cache[num]
-    local mcs
-    if skel then
-        mcs = decode_kept(mcs_data, num, skel.keep)
-    else
-        local full = decode_transforms(mcs_data, num)
-        if not full then
-            return nil
+    local indices = (num == 68) and BONE_TABLE_68 or BONE_TABLE_STANDARD
+    local mx = 0
+    for _, idx in ipairs(indices) do
+        if idx > mx then
+            mx = idx
         end
-        local bs_data = theraohe.read_u64(mesh + CACHED_BONE_SPACE_OFF)
-        local bs_num = theraohe.read_u32(mesh + CACHED_BONE_SPACE_OFF + 8)
-        if bs_data and bs_data ~= 0 and bs_num == num then
-            local bs = decode_transforms(bs_data, num)
-            if bs then
-                skel = bake_skeleton(num, full, bs)
-            end
-        end
-        if not skel then
-            return nil
-        end
-        mcs = full
     end
-    if not mcs then
+    if mx >= num then
+        -- 骨架版本未認識 (C++ pubg 模式只有 68/standard 兩種佈局)
         return nil
     end
-    -- mesh 本身相對根組件: RelativeLocation (+0x1E4), RelativeRotation (+0x1F0); mesh 父缺省為根
-    local mpx = theraohe.read_f32(mesh + 0x1e4) or 0.0
-    local mpy = theraohe.read_f32(mesh + 0x1e8) or 0.0
-    local mpz = theraohe.read_f32(mesh + 0x1ec) or 0.0
-    local mpitch = theraohe.read_f32(mesh + 0x1f0) or 0.0
-    local myaw = theraohe.read_f32(mesh + 0x1f4) or 0.0
-    local mroll = theraohe.read_f32(mesh + 0x1f8) or 0.0
-    local fx, fy, fz, rx, ry, rz, ux, uy, uz = rotator_axes(rpitch, ryaw, rroll)
-    local mfx, mfy, mfz, mrx, mry, mrz, mux, muy, muz = rotator_axes(mpitch, myaw, mroll)
-    -- mesh 基底 (每列為 mesh 局部軸在世界上的方向)
-    local ex = fx * mfx + rx * mfy + ux * mfz
-    local ey = fy * mfx + ry * mfy + uy * mfz
-    local ez = fz * mfx + rz * mfy + uz * mfz
-    local eyx = fx * mrx + rx * mry + ux * mrz
-    local eyy = fy * mrx + ry * mry + uy * mrz
-    local eyz = fz * mrx + rz * mry + uz * mrz
-    local ezx = fx * mux + rx * muy + ux * muz
-    local ezy = fy * mux + ry * muy + uy * muz
-    local ezz = fz * mux + rz * muy + uz * muz
-    -- mesh 原點 (世界): 根位置 + 根基底 * mesh 相對位置, 再下移膠囊半高 (骨架腳原點 vs 根中心)
-    local ox = x + fx * mpx + rx * mpy + ux * mpz
-    local oy = y + fy * mpx + ry * mpy + uy * mpz
-    local oz = z + fz * mpx + rz * mpy + uz * mpz - PUBGM_CAPSULE_HALF
     local sxs, sys, t = {}, {}, {}
-    for i = 1, num do
-        local bi = mcs[i]
-        if bi then
-            local wx = ex * bi.tx + eyx * bi.ty + ezx * bi.tz + ox
-            local wy = ey * bi.tx + eyy * bi.ty + ezy * bi.tz + oy
-            local wz = ez * bi.tx + eyz * bi.ty + ezz * bi.tz + oz
+    for i, idx in ipairs(indices) do
+        local base = bone_data + idx * FTRANSFORM_SIZE
+        local btx = theraohe.read_f32(base + 16)
+        local bty = theraohe.read_f32(base + 20)
+        local btz = theraohe.read_f32(base + 24)
+        if btx and bty and btz then
+            local wx = btx * c11 + bty * c21 + btz * c31 + tx
+            local wy = btx * c12 + bty * c22 + btz * c32 + ty
+            local wz = btx * c13 + bty * c23 + btz * c33 + tz
+            if i == 1 then
+                wz = wz + 7.0 -- 頭骨: C++ 專案脖子長 7cm
+            end
+            t[i] = { wx = wx, wy = wy, wz = wz }
             local px, py, cw = project(VP, wx, wy, wz, sw, sh)
             if px and cw > 0.0 then
-                sxs[i], sys[i] = px, py
-                t[i] = { tx = bi.tx, ty = bi.ty, tz = bi.tz }
+                sxs[i] = px
+                sys[i] = py
             end
         end
     end
-    return { num = num, sxs = sxs, sys = sys, t = t, parents = skel.parents, keep = skel.keep }
+    return { num = #indices, sxs = sxs, sys = sys, t = t }
 end
-
 -- 相機裝配: POV 位置/旋轉/FOV 同源, 見檔頭; 回傳 nil 表示本幀無法投影 (早退)
 local function setup_camera()
     local onself = resolve_first(ONSELF_PATTERN)
@@ -467,7 +386,7 @@ local function setup_camera()
     }
 end
 
--- 走訪 Actors, 過濾出存活敵人, 只記錄 root 投影級資訊 (actor / root 投影 / 根世界座標 / 天線投影)
+-- 走訪 Actors, 過濾出存活敵人, 只記錄 root 投影級資訊 (actor / root 投影 / 根世界座標)
 -- 骨架與立方體角點是重成本: 只在需要時用 enemy_detail 對「候選」單個目標計算
 -- 回傳 (enemies, actors_num); 失敗回傳 (nil, 錯誤碼) — 與舊 enemy_lines 一致
 local function scan_enemy_roots(cam)
@@ -488,43 +407,40 @@ local function scan_enemy_roots(cam)
     if num > 4096 then
         return nil, num
     end
-    local own_vtbl = theraohe.read_u64(onself)
-    if not own_vtbl then
-        return nil, -4
-    end
     local enemies = {}
     for i = 0, num - 1 do
         local actor = theraohe.read_u64(arr + i * 8)
         if actor and actor ~= 0 and actor ~= onself then
-            local vtbl = theraohe.read_u64(actor)
-            if vtbl == own_vtbl then
-                local dead = theraohe.read_u8(actor + B_DEAD_OFF)
+            -- 玩家 pawn: 專屬常量標記, 比 vtable 相等判斷穩妥 (不同載具/補給類不會誤入)
+            local marker = theraohe.read_f32(actor + PLAYER_MARK_OFF)
+            if marker == PLAYER_MARK then
+                local state = theraohe.read_u32(actor + STATE_OFF)
                 local team = theraohe.read_u32(actor + TEAM_ID_OFF)
-                local is_bot = theraohe.read_u8(actor + IS_BOT_OFF)
-                if dead == 0 and team and my_team and team ~= my_team then
+                local is_bot = is_bot_flag(actor)
+                -- TeamID<=0 多為無隊伍的 AI 佔位/載具幽靈, 跳過
+                if not is_dead_state(state) and team and my_team and team ~= my_team and team > 0 then
                     local root = theraohe.read_u64(actor + 0x208)
                     if root and root ~= 0 then
                         local x = theraohe.read_f32(root + 0x1e4)
                         local y = theraohe.read_f32(root + 0x1e8)
                         local z = theraohe.read_f32(root + 0x1ec)
                         if x and y and z then
+                            local rpitch = theraohe.read_f32(root + RELATIVE_ROTATION_OFF) or 0.0
+                            local ryaw = theraohe.read_f32(root + RELATIVE_ROTATION_OFF + 4) or 0.0
+                            local rroll = theraohe.read_f32(root + RELATIVE_ROTATION_OFF + 8) or 0.0
                             local sx, sy, cw = project(VP, x, y, z, sw, sh)
-                            if sx and cw > 0 then
-                                local rpitch = theraohe.read_f32(root + RELATIVE_ROTATION_OFF) or 0.0
-                                local ryaw = theraohe.read_f32(root + RELATIVE_ROTATION_OFF + 4) or 0.0
-                                local rroll = theraohe.read_f32(root + RELATIVE_ROTATION_OFF + 8) or 0.0
-                                -- 天線投影終點 (高 z+100)
-                                local ax, ay = project(VP, x, y, z + 100.0, sw, sh)
-                                enemies[#enemies + 1] = {
-                                    actor = actor,
-                                    x = x, y = y, z = z,
-                                    sx = sx,
-                                    sy = sy,
-                                    is_bot = is_bot ~= nil and is_bot ~= 0,
-                                    rpitch = rpitch, ryaw = ryaw, rroll = rroll,
-                                    ax = ax, ay = ay,
-                                }
+                            if not cw or cw <= 0.0 then
+                                sx, sy = nil, nil
                             end
+                            enemies[#enemies + 1] = {
+                                actor = actor,
+                                x = x, y = y, z = z,
+                                sx = sx,
+                                sy = sy,
+                                is_bot = is_bot,
+                                team = team,
+                                rpitch = rpitch, ryaw = ryaw, rroll = rroll,
+                            }
                         end
                     end
                 end
@@ -538,18 +454,40 @@ end
 -- 直接在 e 上附加 corners/min_x/min_y/max_x/max_y/bones/hb_x/hb_y 後回傳
 local function enemy_detail(cam, e)
     local VP, sw, sh = cam.VP, cam.sw, cam.sh
-    local corners = cube_corners(VP, e.x, e.y, e.z, e.rpitch, e.ryaw, e.rroll, 60.0, 60.0, 200.0, sw, sh)
-    local min_x, min_y, max_x, max_y = cube_minmax(corners)
     local bones = mesh_bone_screen(VP, e.actor, e.x, e.y, e.z, e.rpitch, e.ryaw, e.rroll, sw, sh)
-    local hb = (HighlightBone or -1) + 1
-    local hb_x, hb_y
+    -- 立方體對齊當前姿勢實際身高: 頭骨 → 較低踝骨跨度 (+14cm 裕量); 無骨資料時退回 2m 固定
+    local cz, sz = e.z, 200.0
+    if bones and bones.t then
+        local head = bones.t[1]
+        local a14, a15 = bones.t[14], bones.t[15]
+        local bot_z = math.huge
+        if a14 then bot_z = math.min(bot_z, a14.wz) end
+        if a15 then bot_z = math.min(bot_z, a15.wz) end
+        if head and bot_z < math.huge and head.wz > bot_z then
+            local top_z = head.wz + 15.0 -- 頭骨偏脖子位, 頭頂再加 15cm
+            sz = math.max(top_z - bot_z, 50.0) -- 高度下限 50cm
+            cz = (top_z + bot_z) * 0.5
+        end
+    end
+    local corners = cube_corners(VP, e.x, e.y, cz, e.rpitch, e.ryaw, e.rroll, 60.0, 60.0, sz, sw, sh)
+    local min_x, min_y, max_x, max_y = cube_minmax(corners)
+    local ax, ay
+    if e.sx then
+        ax, ay = project(VP, e.x, e.y, cz + sz * 0.5, sw, sh)
+    end
+    e.ax, e.ay = ax, ay
+    local hb = ((AimbotBone or -1) + 1)
+    local hb_x, hb_y, hb_w
     if bones and bones.sxs[hb] then
         hb_x, hb_y = bones.sxs[hb], bones.sys[hb]
+    end
+    if bones and bones.t and bones.t[hb] then
+        hb_w = { x = bones.t[hb].wx, y = bones.t[hb].wy, z = bones.t[hb].wz }
     end
     e.corners = corners
     e.min_x, e.min_y, e.max_x, e.max_y = min_x, min_y, max_x, max_y
     e.bones = bones
-    e.hb_x, e.hb_y = hb_x, hb_y
+    e.hb_x, e.hb_y, e.hb_w = hb_x, hb_y, hb_w
     return e
 end
 
@@ -569,6 +507,7 @@ end
 -- ESP 渲染: 天線線 / 立方體 / 骨骼連線 (高亮骨橙色); VP 供蓋角短柱重投影用
 local function esp_render(VP, enemies, sw, sh)
     local hr, hg, hbh = 255, 165, 0
+    local hb = ((AimbotBone or -1) + 1)
     for _, e in ipairs(enemies) do
         -- 人機 (IsBot) 畫白色; 真人畫紅色
         local cr, cg, cb = 255, 0, 0
@@ -601,20 +540,13 @@ local function esp_render(VP, enemies, sw, sh)
         end
         if e.bones then
             local b = e.bones
-            local min2 = BONE_MIN_LINK_CM * BONE_MIN_LINK_CM
-            local hb = HighlightBone or -1
-            for i = 2, b.num do
-                local pi = b.parents[i]
-                if pi and b.sxs[i] and b.sxs[pi] and b.t[i] and b.t[pi] then
-                    local dx = b.t[i].tx - b.t[pi].tx
-                    local dy = b.t[i].ty - b.t[pi].ty
-                    local dz = b.t[i].tz - b.t[pi].tz
-                    if dx * dx + dy * dy + dz * dz >= min2 then
-                        if i - 1 == hb or pi - 1 == hb then
-                            theraohe.draw_line(b.sxs[pi], b.sys[pi], b.sxs[i], b.sys[i], hr, hg, hbh, 170)
-                        else
-                            theraohe.draw_line(b.sxs[pi], b.sys[pi], b.sxs[i], b.sys[i], cr, cg, cb, 170)
-                        end
+            for _, l in ipairs(LIMB_PAIRS) do
+                local a, c = l[1], l[2]
+                if b.sxs[a] and b.sxs[c] then
+                    if a == hb or c == hb then
+                        theraohe.draw_line(b.sxs[a], b.sys[a], b.sxs[c], b.sys[c], hr, hg, hbh, 170)
+                    else
+                        theraohe.draw_line(b.sxs[a], b.sys[a], b.sxs[c], b.sys[c], cr, cg, cb, 170)
                     end
                 end
             end
@@ -634,31 +566,101 @@ local function aim_release()
 end
 
 -- 整個 Tick 沒有 Aimbot_Pressing 呼叫 (使用者已放手) → 下一幀自動抬手; aim 模組卸下
+local function aim_shortcut_down()
+    return ticks <= aim_last_call + 1
+end
+
 local function aim_release_if_idle()
-    if ticks > aim_last_call + 1 then
+    if not aim_shortcut_down() then
         aim_requested = false
     end
-    if aim_finger_down and ticks > aim_last_call + 1 then
+    if aim_finger_down and not aim_shortcut_down() then
         aim_release()
+    end
+end
+
+-- FullyAutoTrigger (slot 8): 同一組 按下→計時器滿間隙→鬆手→下次請求→重按 循環
+-- 兩種觸發源共用本循環, 依優先序取第一個有效落點 (Aimbot 捷徑 > AutoTrigger):
+--   A 捷徑按下且「FullyAutoTrigger」on → 落點 = 按壓位置
+--   B 否則 AutoTrigger on 且目標對準 Forward 軸線 → 落點 = 最後 Aimbot_Pressing 落點
+-- 都無 → 鬆手
+local FIRE_SLOT = 8
+
+local function fire_tap_release()
+    if fire_finger_down then
+        theraohe.touch_up(fire_x, fire_y, FIRE_SLOT)
+    end
+    fire_finger_down = false
+end
+
+-- Aimbot 捷徑開火: 捷徑按下且「FullyAutoTrigger」on → 落點 = 按壓位置
+local function trigger_aim_fire()
+    if aim_shortcut_down() and FullyAutoTrigger == true
+        and aim_press_x and aim_press_y then
+        return aim_press_x, aim_press_y
+    end
+end
+
+-- AutoTrigger: Aimbot 未按下本 Tick, 且目標高亮骨世界座標點對準相機 Forward 軸線 → 落點 = 最後按壓位置
+-- 根點 (root z = 腳底) 會帶入 ~150cm 垂直差, 故取骨骼點 (頭骨 +7cm 脖子位)
+local function trigger_autotrigger(cam, nearest)
+    if aim_shortcut_down() or not autotrigger_on then return end
+    if not (aim_press_x and aim_press_y) then return end
+    if not (nearest and nearest.hb_w) then return end
+    local fx2, fy2, fz2 = rotator_axes(cam.pitch, cam.yaw, cam.roll)
+    local dx, dy, dz = nearest.hb_w.x - cam.px, nearest.hb_w.y - cam.py, nearest.hb_w.z - cam.pz
+    local fw = dx * fx2 + dy * fy2 + dz * fz2
+    if fw <= 0.0 then return end
+    local ux, uy, uz = dy * fz2 - dz * fy2, dz * fx2 - dx * fz2, dx * fy2 - dy * fx2
+    local thr = tonumber(AutoTriggerThreshold) or 30
+    if math.sqrt(ux * ux + uy * uy + uz * uz) <= thr then
+        return aim_press_x, aim_press_y
+    end
+end
+
+-- 依優先序回傳第一個有效落點 (Aimbot 捷徑 > AutoTrigger); 無落點 → 無回傳值
+local function fire_requested(cam, nearest)
+    local x, y = trigger_aim_fire()
+    if x then return x, y end
+    return trigger_autotrigger(cam, nearest)
+end
+
+local function fire_cycle(req_x, req_y)
+    if req_x and req_y then
+        if not fire_finger_down then
+            fire_x, fire_y = req_x, req_y
+            theraohe.touch_down(fire_x, fire_y, FIRE_SLOT)
+            fire_finger_down = true
+            fire_down_at = theraohe.now()
+            return
+        end
+        local gap = tonumber(FireGap) or 0.05
+        if theraohe.now() - fire_down_at >= gap then
+            fire_tap_release()
+        end
+    else
+        fire_tap_release()
     end
 end
 
 -- Tick 內的自瞄模組: 短捷徑只是「影響器」, 只決定本模組是否上班
 -- enemies 直接複用 ESP 全詳細掃描結果 — 不重複走訪; 僅一個候選做詳細滑動
 -- ShowAimbotRect / ShowCenterCross 是全局調試信息: 未按下自瞄鈕也顯示候選矩形與中心十字
--- AimbotRect 兩個語義: 黃框 = 可以接獲 (中心落在包圍盒); 綠框 = 正在追蹤快取目標 (脫框也畫)
+-- AimbotRect 兩個語義: 黃框 = 可以接獲 (中心落在包圍盒); 紅框 = 正在追蹤快取目標 (脫框也畫)
 local function aim_tick(cam, enemies)
     local sw, sh = cam.sw, cam.sh
     local cx, cy = sw * 0.5, sh * 0.5
     local nearest, nearest_d2
     for _, e in ipairs(enemies) do
-        local dx, dy = e.sx - cx, e.sy - cy
-        local d2 = dx * dx + dy * dy
-        if not nearest_d2 or d2 < nearest_d2 then
-            nearest, nearest_d2 = e, d2
+        if e.sx then
+            local dx, dy = e.sx - cx, e.sy - cy
+            local d2 = dx * dx + dy * dy
+            if not nearest_d2 or d2 < nearest_d2 then
+                nearest, nearest_d2 = e, d2
+            end
         end
     end
-    if ShowCenterCross then
+    if (ShowCenterCross) then
         theraohe.draw_line(cx - 12.0, cy, cx + 12.0, cy, 0, 255, 0, 240)
         theraohe.draw_line(cx, cy - 12.0, cx, cy + 12.0, 0, 255, 0, 240)
     end
@@ -674,6 +676,8 @@ local function aim_tick(cam, enemies)
             draw_minmax_rect(nearest.min_x, nearest.min_y, nearest.max_x, nearest.max_y, 255, 255, 0, 220)
         end
     end
+    -- FullyAutoTrigger / AutoTrigger (Aimbot 捷徑優先): 詳見 fire block 註釋
+    fire_cycle(fire_requested(cam, nearest))
     -- 實際自瞄邏輯只在短捷徑積極按壓時執行
     if not aim_requested then
         return
@@ -701,14 +705,22 @@ local function aim_tick(cam, enemies)
     -- 滑動: 目標骨骼 2D - 螢幕中心, 乘倍率; 無骨骼用根錨
     local tx = nearest.hb_x or nearest.sx
     local ty = nearest.hb_y or nearest.sy
-    local mul_x = AimbotMultiplierX or 1.0
-    local mul_y = AimbotMultiplierY or 1.0
+    local mul_x = (AimbotMultiplierX or 1.0)
+    local mul_y = (AimbotMultiplierY or 1.0)
     local dx = (tx - cx) * mul_x
     local dy = (ty - cy) * mul_y
+    local max_drag = AimbotMaxDrag or 0
+    if max_drag > 0 then
+        local mag = math.sqrt(dx * dx + dy * dy)
+        if mag > max_drag then
+            print(string.format("[rodin] 觸碰滑動 %.0f px > %d px, 忽略本幀", mag, max_drag))
+            return
+        end
+    end
     if not aim_finger_down then
         aim_finger_down = true
-        aim_x = math.min(math.max(AimbotStartX, 0.0), sw - 1)
-        aim_y = math.min(math.max(AimbotStartY, 0.0), sh - 1)
+        aim_x = math.min(math.max((AimbotStartX or 2000), 0.0), sw - 1)
+        aim_y = math.min(math.max((AimbotStartY or 200), 0.0), sh - 1)
         theraohe.touch_down(aim_x, aim_y)
     end
     aim_x = math.min(math.max(aim_x + dx, 0.0), sw - 1)
@@ -735,6 +747,76 @@ function Tick()
             print("敵人列舉失敗", anum)
         end
         return
+    end
+    local real, bot = 0, 0
+    for _, e in ipairs(enemies) do
+        if e.is_bot then
+            bot = bot + 1
+        else
+            real = real + 1
+        end
+    end
+    -- 人數統計 (永遠渲染, 0 也畫): 0 灰、>0 彩 (機器人綠 真人紅); 重要性 Heading
+    local cx = sw * 0.5
+    local bot_col = bot > 0 and { 0, 255, 0 } or { 255, 255, 255 }
+    local real_col = real > 0 and { 255, 0, 0 } or { 255, 255, 255 }
+    theraohe.draw_text(cx, 100, 1, 0, string.format("機器人:%d", bot), bot_col[1], bot_col[2], bot_col[3], nil, 2)
+    theraohe.draw_text(cx, 100, 0, 0, string.format("真人:%d", real), real_col[1], real_col[2], real_col[3], nil, 2)
+    -- Yaw 跟隨雷達: 田字正方框(白,淡) + 十字格 + 敵人 '○' + 面向線 (IntToRGB(team))
+    local radar_size = RadarSize; local radar_range = RadarRange
+    if radar_size and radar_range and radar_size > 0 and radar_range > 0 then
+        local cx_r, cy_r = (RadarPosX or 800), (RadarPosY or 350)
+        local half = radar_size * 0.5
+        local range_cm = radar_range * 100.0
+        local k = radar_size / range_cm
+        theraohe.draw_line(cx_r - half, cy_r - half, cx_r + half, cy_r - half, 255, 255, 255, 110)
+        theraohe.draw_line(cx_r + half, cy_r - half, cx_r + half, cy_r + half, 255, 255, 255, 110)
+        theraohe.draw_line(cx_r + half, cy_r + half, cx_r - half, cy_r + half, 255, 255, 255, 110)
+        theraohe.draw_line(cx_r - half, cy_r + half, cx_r - half, cy_r - half, 255, 255, 255, 110)
+        -- 十字分隔, 田字 4 格
+        theraohe.draw_line(cx_r - half, cy_r, cx_r + half, cy_r, 255, 255, 255, 110)
+        theraohe.draw_line(cx_r, cy_r - half, cx_r, cy_r + half, 255, 255, 255, 110)
+        -- 正前方 = 相機 POV Yaw (視角朝向); 敵人面向線用 actor root ryaw
+        -- 主角 root z; 讀不到退回相機 POV z
+        local own_root = theraohe.read_u64(cam.onself + 0x208)
+        local own_z = (own_root and theraohe.read_f32(own_root + 0x1ec)) or cam.pz
+        local yaw = cam.yaw * DEG
+        local cyw, syw = math.cos(yaw), math.sin(yaw)
+        local fwd_x, fwd_y = cyw, syw
+        local right_x, right_y = -syw, cyw
+        for _, e in ipairs(enemies) do
+            local team = e.team or 1
+            local tr, tg, tb = int_to_rgb(team)
+            local dx, dy = e.x - cam.px, e.y - cam.py
+            local half_range = range_cm * 0.5
+            local f = dx * fwd_x + dy * fwd_y
+            local s = dx * right_x + dy * right_y
+            -- 超出範圍 → 映射到邊界上 (沿原方向縮放到方形邊緣)
+            if math.abs(f) > half_range or math.abs(s) > half_range then
+                local scale = math.min(half_range / math.max(math.abs(f), 1e-9), half_range / math.max(math.abs(s), 1e-9))
+                f = f * scale
+                s = s * scale
+            end
+            local px = cx_r + s * k
+            local py = cy_r - f * k
+            theraohe.draw_text(px, py, 0.5, 0.5, "○", tr, tg, tb, nil, 2)
+            -- 高度差徽章: 敵高於/低於主角 → ▲(淺紅)/▼(淺藍) 繪於 ○ 上方; |Δz|<50cm 不畫
+            local dz = e.z - own_z
+            if dz >= 50.0 then
+                theraohe.draw_text(px, py, 0.5, 0.5, "▲", 255, 0, 0, nil, 1)
+            elseif dz <= -50.0 then
+                theraohe.draw_text(px, py, 0.5, 0.5, "▼", 0, 0, 255, nil, 1)
+            end
+            local eyaw = e.ryaw * DEG
+            local efx, efy = math.cos(eyaw), math.sin(eyaw)
+            local es = efx * right_x + efy * right_y
+            local ef = -(efx * fwd_x + efy * fwd_y)
+            local m = math.sqrt(es * es + ef * ef)
+            if m > 1e-6 then
+                local ivec = 30.0 / m
+                theraohe.draw_line(px, py, px + es * ivec, py + ef * ivec, tr, tg, tb, 255)
+            end
+        end
     end
     esp_render(cam.VP, enemies, sw, sh)
     aim_tick(cam, enemies)
@@ -773,7 +855,21 @@ end
 
 -- 短捷徑事件: 與開火鍵重疊之"影響器"; 只決定 Tick 內的自瞄模組是否上班,
 -- 一切自瞄邏輯 (走訪/判定/滑動/抬手) 都在 Tick 的 aim 模組內處理, 不在此函式裡跑
-function Aimbot_Pressing()
+-- x,y = 捷徑按下時手指的屏幕物理像素; 省略則落點清空, FullyAutoTrigger/AutoTrigger 讓位
+Aimbot_Pressing = function(x, y)
     aim_last_call = ticks
     aim_requested = true
+    -- 快取: 每次有效 xy 呼叫更新 (寄信機制: 此即捷徑按下時的位置, 供 AutoTrigger 複用)
+    aim_press_x, aim_press_y = x, y
+end
+
+-- AutoTrigger開關 (捷徑為開關式按鈕: 點擊翻轉並回傳 Bool, 回傳值自動成為按鈕狀態)
+-- 啓用後, Aimbot 沒有按下時, 瞄準目標對準相機 Forward 軸線即在最後 Aimbot_Pressing 落點進入連點循環;
+-- 落點尚未有過 Aimbot_Pressing 則整個不生效, 須先按一次捷徑
+AutoTrigger = function()
+    autotrigger_on = not autotrigger_on
+    if autotrigger_on and not (aim_press_x and aim_press_y) then
+        print("[rodin] AutoTrigger 已開啓, 尚無 Aimbot_Pressing 落點 — 先按一下捷徑")
+    end
+    return autotrigger_on
 end

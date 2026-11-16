@@ -5,13 +5,14 @@ use std::time::{Duration, Instant};
 
 mod console;
 mod display;
-mod keyboard;
+mod gpu_render;
 mod lua_env;
 // 可選外掛: 刪除 src/mcp.rs 並移除此行與 mcp::start 呼叫即完成卸載; UI 不依賴此模組
 mod mcp;
 mod maps;
 mod mem;
 mod nb9;
+mod persist;
 mod screenshot;
 mod sf_keys;
 mod sf_touch;
@@ -98,21 +99,199 @@ type FnSetTrustedOverlay = unsafe extern "C" fn(*mut c_void, *mut c_void, bool) 
 type FnSetPosition = unsafe extern "C" fn(*mut c_void, *mut c_void, f32, f32) -> *mut c_void;
 type FnApply = unsafe extern "C" fn(*mut c_void, bool, bool) -> i32;
 
-unsafe fn sym(handle: *mut c_void, name: &str) -> *mut c_void {
-    let c = CString::new(name).unwrap();
+// Android 大版本之間,私有 C++ 符號的 mangling 會變(Android 17 把
+// SurfaceComposerClient::createSurface 的 LayerMetadata 由傳值改成 const&)。
+// 解析順序:先試 known 完整名,全部失敗則掃描 library 的 .dynsym,
+// 以 Itanium mangled name 中固定的「類別名+函式名」前綴重新定位。
+struct SymDef {
+    known: &'static [&'static str],
+    prefix: Option<&'static str>,
+}
+
+static SYM_STRING8_CTOR: SymDef = SymDef {
+    known: &["_ZN7android7String8C2EPKc"],
+    prefix: None,
+};
+static SYM_INC_STRONG: SymDef = SymDef {
+    known: &["_ZNK7android7RefBase9incStrongEPKv"],
+    prefix: None,
+};
+static SYM_CLIENT_CTOR: SymDef = SymDef {
+    known: &["_ZN7android21SurfaceComposerClientC2Ev"],
+    // 同名有 sp<ISurfaceComposerClient> 參數的 overload, 前綴無法區分
+    prefix: None,
+};
+static SYM_LAYER_METADATA_CTOR: SymDef = SymDef {
+    known: &["_ZN7android3gui13LayerMetadataC2Ev"],
+    prefix: None,
+};
+static SYM_CREATE_SURFACE: SymDef = SymDef {
+    known: &[
+        // Android 17 (SDK 37): LayerMetadata 傳值 -> const&
+        "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEERKNS_3gui13LayerMetadataEPj",
+        "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj",
+    ],
+    prefix: Some("_ZN7android21SurfaceComposerClient13createSurfaceE"),
+};
+static SYM_GET_SURFACE: SymDef = SymDef {
+    known: &["_ZN7android14SurfaceControl10getSurfaceEv"],
+    prefix: Some("_ZN7android14SurfaceControl10getSurfaceE"),
+};
+static SYM_TRANSACTION_CTOR: SymDef = SymDef {
+    known: &["_ZN7android21SurfaceComposerClient11TransactionC2Ev"],
+    // 同名有複製建構 overload, 前綴無法區分
+    prefix: None,
+};
+static SYM_SET_LAYER: SymDef = SymDef {
+    known: &["_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi"],
+    prefix: Some("_ZN7android21SurfaceComposerClient11Transaction8setLayerE"),
+};
+static SYM_SET_TRUSTED_OVERLAY: SymDef = SymDef {
+    known: &["_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb"],
+    // 同名有 TrustedOverlay enum overload, 前綴無法區分, 寧可報錯也不猜
+    prefix: None,
+};
+static SYM_SET_POSITION: SymDef = SymDef {
+    known: &["_ZN7android21SurfaceComposerClient11Transaction11setPositionERKNS_2spINS_14SurfaceControlEEEff"],
+    prefix: Some("_ZN7android21SurfaceComposerClient11Transaction11setPositionE"),
+};
+static SYM_APPLY: SymDef = SymDef {
+    known: &["_ZN7android21SurfaceComposerClient11Transaction5applyEbb"],
+    prefix: Some("_ZN7android21SurfaceComposerClient11Transaction5applyE"),
+};
+
+unsafe fn dlsym_try(handle: *mut c_void, name: &str) -> *mut c_void {
+    let Ok(c) = CString::new(name) else {
+        return ptr::null_mut();
+    };
     dlerror();
-    let p = dlsym(handle, c.as_ptr());
-    if p.is_null() {
-        let err = dlerror();
-        let msg = if err.is_null() {
-            "unknown".to_string()
-        } else {
-            CStr::from_ptr(err).to_string_lossy().into_owned()
-        };
-        eprintln!("[sf] dlsym failed: {name}: {msg}");
-        std::process::exit(2);
+    dlsym(handle, c.as_ptr())
+}
+
+fn elf_dynsym_scan(path: &str, prefix: &str) -> Result<Vec<String>, String> {
+    fn u16le(b: &[u8], o: usize) -> Result<u16, String> {
+        b.get(o..o + 2)
+            .map(|s| u16::from_le_bytes([s[0], s[1]]))
+            .ok_or_else(|| format!("truncated at {o:#x}"))
     }
-    p
+    fn u32le(b: &[u8], o: usize) -> Result<u32, String> {
+        b.get(o..o + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+            .ok_or_else(|| format!("truncated at {o:#x}"))
+    }
+    fn u64le(b: &[u8], o: usize) -> Result<u64, String> {
+        b.get(o..o + 8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+            .ok_or_else(|| format!("truncated at {o:#x}"))
+    }
+
+    let buf = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    if buf.len() < 64 || &buf[..4] != b"\x7fELF" {
+        return Err("not an ELF file".into());
+    }
+    if buf[4] != 2 {
+        return Err("not ELF64".into());
+    }
+    if buf[5] != 1 {
+        return Err("not little-endian".into());
+    }
+    let e_shoff = u64le(&buf, 0x28)? as usize;
+    let e_shentsize = u16le(&buf, 0x3a)? as usize;
+    let mut e_shnum = u16le(&buf, 0x3c)? as usize;
+    if e_shentsize < 64 {
+        return Err(format!("unexpected e_shentsize {e_shentsize}"));
+    }
+    if e_shoff == 0 {
+        return Err("no section header table".into());
+    }
+    if e_shnum == 0 {
+        // SHN_UNDEF 哨兵: 實際 section 數放在 section 0 的 sh_size
+        e_shnum = u64le(&buf, e_shoff + 0x20)? as usize;
+    }
+    let section = |i: usize| -> Result<(u64, u64, u32, u32, u64), String> {
+        let o = e_shoff + i * e_shentsize;
+        Ok((
+            u64le(&buf, o + 0x18)?, // sh_offset
+            u64le(&buf, o + 0x20)?, // sh_size
+            u32le(&buf, o + 0x04)?, // sh_type
+            u32le(&buf, o + 0x28)?, // sh_link
+            u64le(&buf, o + 0x38)?, // sh_entsize
+        ))
+    };
+
+    const SHT_DYNSYM: u32 = 11;
+    for i in 0..e_shnum {
+        let (sh_off, sh_size, sh_type, sh_link, sh_entsize) = section(i)?;
+        if sh_type != SHT_DYNSYM {
+            continue;
+        }
+        let entsz = if sh_entsize == 0 { 24 } else { sh_entsize as usize };
+        let (str_off, _, _, _, _) = section(sh_link as usize)?;
+        let mut out = Vec::new();
+        for j in 0..sh_size as usize / entsz {
+            let o = sh_off as usize + j * entsz;
+            let st_name = u32le(&buf, o)? as usize;
+            let st_shndx = u16le(&buf, o + 6)?;
+            // st_shndx == SHN_UNDEF: 未定義符號, 跳過
+            if st_name == 0 || st_shndx == 0 {
+                continue;
+            }
+            let so = str_off as usize + st_name;
+            let Some(slice) = buf.get(so..) else { continue };
+            let Some(end) = slice.iter().position(|&b| b == 0) else {
+                continue;
+            };
+            let Ok(name) = std::str::from_utf8(&slice[..end]) else {
+                continue;
+            };
+            if name.starts_with(prefix) {
+                out.push(name.to_string());
+            }
+        }
+        return Ok(out);
+    }
+    Err("no .dynsym section".into())
+}
+
+unsafe fn sym(handle: *mut c_void, path: &str, def: &SymDef) -> *mut c_void {
+    for name in def.known.iter() {
+        let p = dlsym_try(handle, name);
+        if !p.is_null() {
+            return p;
+        }
+    }
+    if let Some(prefix) = def.prefix {
+        match elf_dynsym_scan(path, prefix) {
+            Ok(matches) if matches.len() == 1 => {
+                let name = &matches[0];
+                let p = dlsym_try(handle, name);
+                if !p.is_null() {
+                    eprintln!("[sf] known names failed; resolved via ELF scan: {name}");
+                    return p;
+                }
+            }
+            Ok(matches) => {
+                eprintln!(
+                    "[sf] ELF scan ambiguous for {prefix}: {}",
+                    matches.join(", ")
+                );
+            }
+            Err(e) => {
+                eprintln!("[sf] ELF scan failed for {prefix}: {e}");
+            }
+        }
+    }
+    let err = dlerror();
+    let msg = if err.is_null() {
+        "unknown".to_string()
+    } else {
+        CStr::from_ptr(err).to_string_lossy().into_owned()
+    };
+    eprintln!(
+        "[sf] dlsym failed: known=[{}] last error: {msg}",
+        def.known.join(", ")
+    );
+    std::process::exit(2);
 }
 
 unsafe fn cast<F: Copy>(p: *mut c_void) -> F {
@@ -254,6 +433,12 @@ impl FrameCtx<'_> {
             self.args_h = h;
             // Every buffer in the queue must get cleared margins + fresh content.
             self.full_clear = 3;
+            // 狀態欄高度隨方向變, 跟屏同一點刷新, 否則啟動方向以外的狀態欄 inset 會一直錯位
+            if let Some(h) = crate::display::status_bar_height() {
+                if let Ok(mut state) = self.app.lock() {
+                    state.status_bar_h = h;
+                }
+            }
             eprintln!("[sf] visible area {w}x{h} (layer {0}x{0})", self.side);
         }
     }
@@ -284,7 +469,11 @@ impl FrameCtx<'_> {
             let held = std::mem::take(&mut state.shortcut_held);
             if !held.is_empty() {
                 let mut seen = std::collections::HashSet::with_capacity(held.len());
-                for label in held {
+                for (label, pos) in held {
+                    // 開關式捷徑 (被判定為按鈕開關): 每幀連點觸發會反覆翻面, 跳過
+                    if state.shortcut_toggles.contains_key(label.as_str()) {
+                        continue;
+                    }
                     if let Some((stem, function)) = ui::parse_shortcut_label(&label) {
                         if !seen.insert((stem.clone(), function.clone())) {
                             continue;
@@ -295,7 +484,7 @@ impl FrameCtx<'_> {
                             .iter_mut()
                             .find(|s| s.file_name == file)
                         {
-                            crate::lua_env::call(s, &function);
+                            let _ = crate::lua_env::call(s, &function, pos);
                         }
                     }
                 }
@@ -310,12 +499,21 @@ impl FrameCtx<'_> {
             self.canvas_dims = (cw, ch);
         }
         let visible = self.app.lock().map(|state| state.visible).unwrap_or(false);
-        let rendered = self.ui.render(&self.app, &mut self.canvas, cw, ch, cw, ch);
-
-        // Nothing changed: keep the last posted buffer on screen.
-        if !rendered && self.frames > 0 && self.full_clear == 0 {
-            self.beat();
-            return;
+        match self.ui.render(&self.app, &mut self.canvas, cw, ch, cw, ch) {
+            ui::RenderOutcome::Skip => {
+                // Nothing changed: keep the last posted buffer on screen.
+                self.beat();
+                return;
+            }
+            ui::RenderOutcome::Presented => {
+                self.frames += 1;
+                if self.frames == 1 {
+                    eprintln!("[sf] first frame presented (gpu): area={cw}x{ch} visible={visible}");
+                }
+                self.beat();
+                return;
+            }
+            ui::RenderOutcome::Canvas => {}
         }
 
         let mut buf = ANativeWindowBuffer {
@@ -365,7 +563,7 @@ impl FrameCtx<'_> {
         self.frames += 1;
         if self.frames == 1 {
             eprintln!(
-                "[sf] first frame posted: buffer {bw}x{bh} stride={stride} area={cw}x{ch} visible={visible} rendered={rendered}"
+                "[sf] first frame posted: buffer {bw}x{bh} stride={stride} area={cw}x{ch} visible={visible}"
             );
         }
         self.beat();
@@ -500,47 +698,28 @@ unsafe fn dump_head(p: *const u8, len: usize) {
 }
 
 unsafe fn run(args: &Args) {
-    let libgui = dlopen(CString::new("/system/lib64/libgui.so").unwrap().as_ptr(), 1);
-    let libutils = dlopen(
-        CString::new("/system/lib64/libutils.so").unwrap().as_ptr(),
-        1,
-    );
+    const LIBGUI: &str = "/system/lib64/libgui.so";
+    const LIBUTILS: &str = "/system/lib64/libutils.so";
+    let libgui = dlopen(CString::new(LIBGUI).unwrap().as_ptr(), 1);
+    let libutils = dlopen(CString::new(LIBUTILS).unwrap().as_ptr(), 1);
     if libgui.is_null() || libutils.is_null() {
         eprintln!("[sf] dlopen failed: libgui={libgui:?} libutils={libutils:?}");
         std::process::exit(2);
     }
 
-    let string8_ctor: FnString8Ctor = cast(sym(libutils, "_ZN7android7String8C2EPKc"));
-    let inc_strong: FnIncStrong = cast(sym(libutils, "_ZNK7android7RefBase9incStrongEPKv"));
+    let string8_ctor: FnString8Ctor = cast(sym(libutils, LIBUTILS, &SYM_STRING8_CTOR));
+    let inc_strong: FnIncStrong = cast(sym(libutils, LIBUTILS, &SYM_INC_STRONG));
 
-    let client_ctor: FnVoidThis = cast(sym(libgui, "_ZN7android21SurfaceComposerClientC2Ev"));
-    let lm_ctor: FnVoidThis = cast(sym(libgui, "_ZN7android3gui13LayerMetadataC2Ev"));
-    let create_surface: FnCreateSurface = cast(sym(
-        libgui,
-        "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj",
-    ));
-    let get_surface: FnGetSurface = cast(sym(libgui, "_ZN7android14SurfaceControl10getSurfaceEv"));
+    let client_ctor: FnVoidThis = cast(sym(libgui, LIBGUI, &SYM_CLIENT_CTOR));
+    let lm_ctor: FnVoidThis = cast(sym(libgui, LIBGUI, &SYM_LAYER_METADATA_CTOR));
+    let create_surface: FnCreateSurface = cast(sym(libgui, LIBGUI, &SYM_CREATE_SURFACE));
+    let get_surface: FnGetSurface = cast(sym(libgui, LIBGUI, &SYM_GET_SURFACE));
 
-    let tx_ctor: FnVoidThis = cast(sym(
-        libgui,
-        "_ZN7android21SurfaceComposerClient11TransactionC2Ev",
-    ));
-    let tx_set_layer: FnSetLayer = cast(sym(
-        libgui,
-        "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi",
-    ));
-    let tx_set_trusted: FnSetTrustedOverlay = cast(sym(
-        libgui,
-        "_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb",
-    ));
-    let tx_set_position: FnSetPosition = cast(sym(
-        libgui,
-        "_ZN7android21SurfaceComposerClient11Transaction11setPositionERKNS_2spINS_14SurfaceControlEEEff",
-    ));
-    let tx_apply: FnApply = cast(sym(
-        libgui,
-        "_ZN7android21SurfaceComposerClient11Transaction5applyEbb",
-    ));
+    let tx_ctor: FnVoidThis = cast(sym(libgui, LIBGUI, &SYM_TRANSACTION_CTOR));
+    let tx_set_layer: FnSetLayer = cast(sym(libgui, LIBGUI, &SYM_SET_LAYER));
+    let tx_set_trusted: FnSetTrustedOverlay = cast(sym(libgui, LIBGUI, &SYM_SET_TRUSTED_OVERLAY));
+    let tx_set_position: FnSetPosition = cast(sym(libgui, LIBGUI, &SYM_SET_POSITION));
+    let tx_apply: FnApply = cast(sym(libgui, LIBGUI, &SYM_APPLY));
 
     let client = Box::leak(Box::new(Opaque1024([0u8; 1024])));
     let mut name8 = Opaque1024([0u8; 1024]);
@@ -568,7 +747,8 @@ unsafe fn run(args: &Args) {
     let side = initial_screen.width.max(initial_screen.height).max(1);
 
     let mut parent: usize = 0;
-    let flags = if args.skip { 0x40 } else { 0 };
+    // huluwa 已在機上運作的配置: 0x2000 常開 (語意未命名, 本機以此運作), 0x40=eSkipScreenshot 跟随 --skip
+    let flags = 0x2000 | if args.skip { 0x40 } else { 0 };
     let sc_sp = create_surface(
         client_ptr,
         name8.0.as_mut_ptr() as *mut c_void,
@@ -626,11 +806,12 @@ unsafe fn run(args: &Args) {
         if args.offset.is_some() { "manual" } else { "auto" }
     );
 
+    // format=0: 不指定 buffer format, 讓 WSI/producer 自選; CPU 路徑讀 buf.format 自行適配
     let g = ANativeWindow_setBuffersGeometry(
         window,
         side,
         side,
-        1,
+        0,
     );
     eprintln!("[sf] setBuffersGeometry = {g}");
     if g != 0 {
@@ -638,16 +819,20 @@ unsafe fn run(args: &Args) {
         std::process::exit(5);
     }
 
-    let mut ui = match ui::UiHost::load(&args.font, args.font_index) {
+
+    let settings = persist::load();
+    let mut ui = match ui::UiHost::load(&args.font, args.font_index, settings.zoom) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[sf] font load failed: {e}");
             std::process::exit(6);
         }
     };
+    ui.active_backend = settings.backend;
     ui.set_layer_offset(args.x, args.y);
+    ui.set_window(window);
 
-    let app = Arc::new(Mutex::new(ui::AppState::new(args.show)));
+    let app = Arc::new(Mutex::new(ui::AppState::new(args.show, settings)));
     {
         let state = app.lock().unwrap();
         eprintln!(

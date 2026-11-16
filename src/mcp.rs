@@ -4,7 +4,7 @@
 //! 可選外掛: 依賴方向 mcp -> ui (UiAction 事件流), ui 對本模組一無所知
 //! 寫操作一律走 ui::apply_actions 與 GUI 同一條派發路徑, MCP 只產出事件 + 唯讀觀察
 
-use crate::mem::{entry_key, ChangeMode, ValueType};
+use crate::mem::{self, entry_key, ChangeMode, ValueType};
 use crate::ui::{self, AppState, Tab, TypeSlot, UiAction};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters, ServerHandler};
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
@@ -29,6 +29,14 @@ struct ProcsParams {
 struct AttachParams {
     /// 行程 PID (見 procs)
     pid: i32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct TapParams {
+    /// 點擊位置的 X 座標 (物理 px, 如同 adb shell input tap; 寬度 0..2399)
+    x: f32,
+    /// 點擊位置的 Y 座標 (物理 px; 高度 0..1079)
+    y: f32,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -68,6 +76,28 @@ struct ResultsParams {
     limit: Option<usize>,
 }
 
+/// 讀取並解碼 String 預覽: UTF-8 直接 lossy, UTF-16 以 LE u16 後 lossy; 失敗回 None
+fn string_preview(pid: i32, ty: ValueType, addr: u64, len: u16) -> Option<String> {
+    if len == 0 {
+        return None;
+    }
+    let buf = crate::mem::hex_dump(pid, addr, len as usize);
+    if buf.is_empty() {
+        return None;
+    }
+    match ty {
+        ValueType::StringUtf8 => Some(String::from_utf8_lossy(&buf).chars().take(48).collect()),
+        ValueType::StringUtf16 => {
+            let units: Vec<u16> = buf
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            Some(String::from_utf16_lossy(&units).chars().take(48).collect())
+        }
+        _ => None,
+    }
+}
+
 fn parse_type(s: &str) -> Option<(TypeSlot, bool)> {
     match s.to_ascii_lowercase().as_str() {
         "i32" => Some((TypeSlot::S32, true)),
@@ -83,6 +113,8 @@ fn parse_type(s: &str) -> Option<(TypeSlot, bool)> {
         "u8" => Some((TypeSlot::U8, true)),
         "ptr" => Some((TypeSlot::Ptr, true)),
         "range" => Some((TypeSlot::Range, true)),
+        "str16" | "string" | "utf16" => Some((TypeSlot::Utf16, true)),
+        "str8" | "utf8" => Some((TypeSlot::Utf8, true)),
         _ => None,
     }
 }
@@ -152,6 +184,32 @@ impl Theraohe {
     #[tool(description = "回傳當前狀態欄文字")]
     async fn status(&self) -> Result<String, ErrorData> {
         Ok(self.lock()?.status.clone())
+    }
+
+    #[tool(description = "以 overlay 螢幕座標 (物理像素, 如同 `adb shell input tap` 的單位) 點擊 overlay 的某個位置: 用於點擊按鈕/切換檢視等; 座標超過螢幕邊界視為取消")]
+    async fn tap(&self, Parameters(p): Parameters<TapParams>) -> Result<String, ErrorData> {
+        let zoom = {
+            let state = self.lock()?;
+            state.zoom
+        };
+        // 螢幕邏輯座標 (egui) = 物理 px / zoom_factor
+        let x = p.x / zoom;
+        let y = p.y / zoom;
+        let id = egui::TouchId(0);
+        ui::push_touch(&self.app, id, egui::TouchPhase::Start, x, y);
+        ui::push_touch(&self.app, id, egui::TouchPhase::End, x, y);
+        // 等一小段時間讓 UI 產出幀
+        tokio::time::sleep(Duration::from_millis(16)).await;
+        Ok(format!("已點擊 ({:.1}, {:.1})", p.x, p.y))
+    }
+
+    #[tool(description = "切換 overlay 主視窗的折疊狀態 (對應音量鍵開盒/縮回), 用於醒出主 UI")]
+    async fn toggle_overlay(&self) -> Result<String, ErrorData> {
+        let state = self.lock()?;
+        state
+            .collapse_toggle
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok("已觸發折疊切換".to_string())
     }
 
     #[tool(
@@ -324,7 +382,7 @@ impl Theraohe {
     }
 
     #[tool(
-        description = "對已有結果按變化篩選; increased_by/decreased_by/exact_value 需 value, 等待完成後回傳結果數量"
+        description = "對已有結果按變化篩選; increased_by/decreased_by/exact_value 需 value; snapshot 為重新快照(不篩選); 等待完成後回傳結果數量"
     )]
     async fn refine(
         &self,
@@ -338,6 +396,7 @@ impl Theraohe {
             "increased_by" => ChangeMode::IncreasedBy,
             "decreased_by" => ChangeMode::DecreasedBy,
             "exact_value" => ChangeMode::ExactValue,
+            "snapshot" => ChangeMode::Snapshot,
             _ => {
                 return Err(ErrorData::invalid_params(
                     format!("未知模式: {}", p.mode),
@@ -352,7 +411,7 @@ impl Theraohe {
         let actions = {
             let state = self.lock()?;
             if state.scan_slot.is_interval()
-                && !matches!(mode, ChangeMode::AnyChange | ChangeMode::Unchanged)
+                && !matches!(mode, ChangeMode::AnyChange | ChangeMode::Unchanged | ChangeMode::Snapshot)
             {
                 return Err(ErrorData::invalid_params(
                     "區塊模式僅支援 any_change/unchanged",
@@ -362,9 +421,11 @@ impl Theraohe {
             if state.scanning {
                 return Err(ErrorData::internal_error("已有掃描進行中", None));
             }
-            // 常規結果或分塊候選 (區塊模式沒有逐筆 results) 任一可篩選即放行
+            // 常規結果或 256B 快照 (投影出的視圖不可篩) 任一可篩選即放行
             let refinable = !state.scan.typed.is_empty()
-                || (state.scan_slot.is_interval() && state.scan.blocks.is_some());
+                || (state.scan_slot.is_interval()
+                    && state.frozen_ty == ValueType::Range
+                    && state.scan.blocks.is_some());
             if !refinable {
                 return Err(ErrorData::invalid_params("無結果可篩選, 請先 scan", None));
             }
@@ -410,7 +471,7 @@ impl Theraohe {
     ) -> Result<String, ErrorData> {
         let (addrs, out) = {
             let state = self.lock()?;
-            let total = state.scan.typed.len();
+            let total = state.preview_row_count();
             if total == 0 {
                 return Ok("無結果".to_string());
             }
@@ -418,37 +479,43 @@ impl Theraohe {
             let size = ty.size();
             // 區塊模式沒有寬度/型別語意, 一律顯示 8 位元組原始位元
             let raw = if size == 0 { 8 } else { size };
-            let offset = p.offset.unwrap_or(0);
+            let offset = p.offset.unwrap_or(0).min(total);
             let limit = p.limit.unwrap_or(50).clamp(1, 500);
             let mut out = format!("共 {total} 個結果\n");
             let mut addrs = Vec::with_capacity(limit);
-            for entry in state.scan.typed.iter().skip(offset).take(limit) {
-                addrs.push(entry_key(entry.addr, entry.bit));
+            for i in offset..(offset + limit).min(total) {
+                let Some((base, bit, window_bits, len)) = state.preview_row(i) else {
+                    continue;
+                };
+                addrs.push(entry_key(base, bit));
                 let bits = state
                     .live_bits
-                    .get(&entry_key(entry.addr, entry.bit))
+                    .get(&entry_key(base, bit))
                     .copied()
-                    .unwrap_or(entry.bits);
+                    .unwrap_or(window_bits);
                 let addr_text = if size == 0 {
-                    format!("0x{:012x}", entry.addr)
+                    format!("0x{base:012x}")
                 } else if matches!(ty, ValueType::BoolBit) {
-                    format!("0x{:012x}({})", entry.addr, entry.bit)
+                    format!("0x{base:012x}({bit})")
                 } else {
-                    format!("0x{:012x}", entry.addr)
+                    format!("0x{base:012x}")
                 };
                 let raw_text = if matches!(ty, ValueType::BoolBit) {
                     format!("{}", bits as u8)
+                } else if size == 0 && mem::is_string(ty) {
+                    format!("0x{:016x}", bits)
                 } else {
                     ui::hex_bytes(bits, raw)
                 };
-                out.push_str(&format!(
-                    "{addr_text}  {raw_text}  {}\n",
-                    if size == 0 {
-                        format!("0x{bits:x}")
-                    } else {
-                        ty.format(bits)
-                    }
-                ));
+                let parsed_text = if size == 0 && mem::is_string(ty) {
+                    // 直接解碼字串 (可讀), 若讀不到退回 hash hex
+                    string_preview(state.pid, ty, base, len).unwrap_or_else(|| format!("0x{bits:x}"))
+                } else if size == 0 {
+                    format!("0x{bits:x}")
+                } else {
+                    ty.format(bits)
+                };
+                out.push_str(&format!("{addr_text}  {raw_text}  {parsed_text}\n"));
             }
             (addrs, out)
         };
@@ -472,40 +539,42 @@ impl Theraohe {
         let raw = if size == 0 { 8 } else { size };
         let mut n = 0usize;
         let mut out = String::new();
-        for entry in state.scan.typed.iter() {
-            if !state.selected.contains(&entry_key(entry.addr, entry.bit)) {
+        for i in 0..state.preview_row_count() {
+            let Some((base, bit, window_bits, len)) = state.preview_row(i) else {
+                continue;
+            };
+            let key = entry_key(base, bit);
+            if !state.selected.contains(&key) {
                 continue;
             }
             n += 1;
-            let bits = state
-                .live_bits
-                .get(&entry_key(entry.addr, entry.bit))
-                .copied()
-                .unwrap_or(entry.bits);
-            let mark = if bits != entry.bits {
+            let bits = state.live_bits.get(&key).copied().unwrap_or(window_bits);
+            // 切換型別: 凍結解讀不同, 一律標記已變更
+            let mark = if ty != state.frozen_ty || bits != window_bits {
                 "  [已變更]"
             } else {
                 ""
             };
             let addr_text = if matches!(ty, ValueType::BoolBit) {
-                format!("0x{:012x}({})", entry.addr, entry.bit)
+                format!("0x{base:012x}({bit})")
             } else {
-                format!("0x{:012x}", entry.addr)
+                format!("0x{base:012x}")
             };
             let raw_text = if matches!(ty, ValueType::BoolBit) {
                 format!("{}", bits as u8)
+            } else if size == 0 && mem::is_string(ty) {
+                format!("0x{:016x}", bits)
             } else {
                 ui::hex_bytes(bits, raw)
             };
-            out.push_str(&format!(
-                "{addr_text}  {raw_text}  {}{}\n",
-                if size == 0 {
-                    format!("0x{bits:x}")
-                } else {
-                    ty.format(bits)
-                },
-                mark
-            ));
+            let parsed_text = if size == 0 && mem::is_string(ty) {
+                string_preview(state.pid, ty, base, len).unwrap_or_else(|| format!("0x{bits:x}"))
+            } else if size == 0 {
+                format!("0x{bits:x}")
+            } else {
+                ty.format(bits)
+            };
+            out.push_str(&format!("{addr_text}  {raw_text}  {parsed_text}{mark}\n"));
         }
         Ok(format!("選中 {n} 項\n{out}"))
     }

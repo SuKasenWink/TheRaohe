@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask"]
+members = ["xtask", "plugins/egui_on-screen_ime_temp"]
 
 [package]
 name = "theraohe"
@@ -12,8 +12,13 @@ name = "theraohe"
 path = "src/theraohe.rs"
 
 [dependencies]
+egui_on-screen_ime_temp = { path = "plugins/egui_on-screen_ime_temp" }
+egui-wgpu = { version = "0.37", features = ["capture"] }
+raw-window-handle = "0.6"
+pollster = "0.4"
 libc = "0.2"
 xxhash-rust = { version = "0.8.19", default-features = false, features = ["xxh3"] }
+memchr = "2"
 egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
 egui_software_backend = { package = "hdrshot-egui-backend", version = "0.2.0" }
 glam = "0.29"
@@ -25,6 +30,7 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 serde = { version = "1.0.229", features = ["derive"] }
 schemars = "1.2.3"
 mlua = { version = "0.12", default-features = false, features = ["lua54", "vendored", "send"] }
+toon-format = { version = "0.7.0", default-features = false }
 
 [profile.release]
 opt-level = "z"

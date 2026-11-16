@@ -28,9 +28,11 @@ pub enum ValueType {
     Int16,
     UInt16,
     Range,
+    StringUtf16,
+    StringUtf8,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum ChangeMode {
     ExactValue,
     AnyChange,
@@ -40,6 +42,7 @@ pub enum ChangeMode {
     IncreasedBy,
     DecreasedBy,
     Between,
+    Snapshot,
 }
 
 #[derive(Clone, Copy)]
@@ -48,6 +51,8 @@ pub struct ResultEntry {
     pub bits: u64,
     /// BoolBit 結果專用: 該位在位元組內的位置; 其餘型別恆 0
     pub bit: u8,
+    /// String 結果專用: needle 位元組長度; 其餘型別恆 0
+    pub len: u16,
 }
 
 /// 以 (addr, bit) 聯合作為 selected/live_bits 的鍵; 要求 addr < 2^61
@@ -123,6 +128,7 @@ impl ValueType {
             ValueType::Bool | ValueType::BoolBit | ValueType::UInt8 => 1,
             ValueType::Int16 | ValueType::UInt16 => 2,
             ValueType::Range => 0,
+            ValueType::StringUtf16 | ValueType::StringUtf8 => 0,
         }
     }
 
@@ -141,6 +147,8 @@ impl ValueType {
             ValueType::Int16 => "I16",
             ValueType::UInt16 => "U16",
             ValueType::Range => "Range",
+            ValueType::StringUtf16 => "Utf16",
+            ValueType::StringUtf8 => "Utf8",
         }
     }
 
@@ -150,6 +158,8 @@ impl ValueType {
             return None;
         }
         match self {
+            ValueType::StringUtf16 => encode_needle(ValueType::StringUtf16, text).map(|b| xxh3::xxh3_64(&b)),
+            ValueType::StringUtf8 => encode_needle(ValueType::StringUtf8, text).map(|b| xxh3::xxh3_64(&b)),
             ValueType::Int32 => text.parse::<i32>().ok().map(|v| v as u32 as u64),
             ValueType::UInt32 => parse_u64(text).map(|v| v as u32 as u64),
             ValueType::Int64 => text.parse::<i64>().ok().map(|v| v as u64),
@@ -168,6 +178,7 @@ impl ValueType {
 
     pub fn format(self, bits: u64) -> String {
         match self {
+            ValueType::StringUtf16 | ValueType::StringUtf8 => format!("0x{bits:016x}"),
             ValueType::Int32 => format!("{}", bits as u32 as i32),
             ValueType::UInt32 => format!("{}", bits as u32),
             ValueType::Int64 => format!("{}", bits as i64),
@@ -196,6 +207,7 @@ impl ChangeMode {
             ChangeMode::IncreasedBy => "增加了：",
             ChangeMode::DecreasedBy => "減少了：",
             ChangeMode::Between => "範圍：",
+            ChangeMode::Snapshot => "記錄快照",
         }
     }
 }
@@ -329,6 +341,8 @@ pub(crate) fn compare(ty: ValueType, a: u64, b: u64) -> Ordering {
         ValueType::Int16 => (a as u16 as i16).cmp(&(b as u16 as i16)),
         ValueType::UInt16 => (a as u16).cmp(&(b as u16)),
         ValueType::Range => Ordering::Equal,
+        // String: bits 即 needle 雜湊, 規則=等值判斷 (變化/原樣篩選), 增減無語意
+        ValueType::StringUtf16 | ValueType::StringUtf8 => a.cmp(&b),
     }
 }
 
@@ -345,7 +359,7 @@ fn wrapping_sub(ty: ValueType, a: u64, b: u64) -> u64 {
         ValueType::Ptr => a.wrapping_sub(b),
         ValueType::Int16 => (a as u16 as i16).wrapping_sub(b as u16 as i16) as u16 as u64,
         ValueType::UInt16 => (a as u16).wrapping_sub(b as u16) as u64,
-        ValueType::Range => 0,
+        ValueType::Range | ValueType::StringUtf16 | ValueType::StringUtf8 => 0,
     }
 }
 
@@ -419,6 +433,7 @@ fn scan_buffer(
                         addr: addr + i as u64,
                         bits: val,
                         bit: k,
+                        len: 0,
                     });
                 }
             }
@@ -435,6 +450,7 @@ fn scan_buffer(
                 addr: addr + (i * size) as u64,
                 bits: val,
                 bit: 0,
+                len: 0,
             });
         }
     }
@@ -528,6 +544,131 @@ fn scan_block(
     false
 }
 
+pub fn is_string(ty: ValueType) -> bool {
+    matches!(ty, ValueType::StringUtf16 | ValueType::StringUtf8)
+}
+
+/// 依型別把輸入文字編碼為 needle 位元組; 空字串或非法輸入回傳 None
+pub fn encode_needle(ty: ValueType, text: &str) -> Option<Vec<u8>> {
+    if text.is_empty() {
+        return None;
+    }
+    match ty {
+        ValueType::StringUtf16 => {
+            let mut out = Vec::with_capacity(text.len() * 2);
+            for unit in text.encode_utf16() {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+            Some(out)
+        }
+        ValueType::StringUtf8 => Some(text.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+/// 從記憶體 needle bytes 取雜湊; 字串比較用此 (collision-free 足夠對 64-bit xxh3)
+pub fn string_hash(needle: &[u8]) -> u64 {
+    xxh3::xxh3_64(needle)
+}
+
+fn scan_span_string(
+    pid: i32,
+    addr: u64,
+    len: u64,
+    needle: &[u8],
+    out: &mut Vec<ResultEntry>,
+    scanned_bytes: &mut u64,
+    buf: &mut [u8],
+) -> bool {
+    let needle_len = needle.len();
+    let hash = string_hash(needle);
+    let mut off = 0u64;
+    while off < len && out.len() < SCAN_LIMIT {
+        let take = (SCAN_CHUNK as u64).min(len - off);
+        let read_len = take as usize;
+        if !nb9::read(pid, addr + off, &mut buf[..read_len]) {
+            off += take;
+            continue;
+        }
+        *scanned_bytes += read_len as u64;
+        let chunk = &buf[..read_len];
+        let mut pos = 0usize;
+        while pos < chunk.len() {
+            let Some(i) = memchr::memchr(needle[0], &chunk[pos..]) else {
+                break;
+            };
+            let at = pos + i;
+            // needle 完整落在本區塊內: 直接比對
+            if at + needle_len <= chunk.len() {
+                if &chunk[at..at + needle_len] == needle {
+                    out.push(ResultEntry {
+                        addr: addr + off + at as u64,
+                        bits: hash,
+                        bit: 0,
+                        len: needle_len as u16,
+                    });
+                    if out.len() >= SCAN_LIMIT {
+                        return true;
+                    }
+                    pos = at + needle_len;
+                    continue;
+                }
+            } else {
+                // needle 跨越區塊邊界: 以獨立讀取覆核 (避免遺漏, 避免重複)
+                let mut full = vec![0u8; needle_len];
+                if nb9::read(pid, addr + off + at as u64, &mut full) && full.as_slice() == needle {
+                    out.push(ResultEntry {
+                        addr: addr + off + at as u64,
+                        bits: hash,
+                        bit: 0,
+                        len: needle_len as u16,
+                    });
+                    if out.len() >= SCAN_LIMIT {
+                        return true;
+                    }
+                }
+            }
+            pos = at + 1;
+        }
+        off += take;
+    }
+    out.len() >= SCAN_LIMIT
+}
+
+/// 走映射級依 needles 搜尋字串命中位置
+pub fn scan_string(pid: i32, ty: ValueType, needle: &[u8], maps: &[MapRegion]) -> ScanOutcome {
+    let mut pagemap = Pagemap::open(pid);
+    let _ = ty;
+    let mut out = Vec::new();
+    let mut scanned_bytes = 0;
+    let mut buf = vec![0u8; SCAN_CHUNK as usize];
+    'regions: for map in maps {
+        if is_absolute_excluded(map) {
+            continue;
+        }
+        let hit_limit = match pagemap.as_mut().and_then(|p| p.intervals(map)) {
+            Some(intervals) => {
+                let mut hit = false;
+                for (start, end) in intervals {
+                    if scan_span_string(pid, start, end - start, needle, &mut out, &mut scanned_bytes, &mut buf) {
+                        hit = true;
+                        break;
+                    }
+                }
+                hit
+            }
+            None => scan_span_string(pid, map.start, map.end - map.start, needle, &mut out, &mut scanned_bytes, &mut buf),
+        };
+        if hit_limit {
+            break 'regions;
+        }
+    }
+    ScanOutcome {
+        results: out,
+        scanned_bytes,
+    }
+}
+
 fn scan_span(
     pid: i32,
     ty: ValueType,
@@ -546,6 +687,13 @@ fn scan_span(
 }
 
 pub fn scan_ranges(pid: i32, ty: ValueType, filter: ScanFilter, maps: &[MapRegion]) -> ScanOutcome {
+    // String 走 scan_string; 若呼叫方誤來, 回傳空保護 (chunks_exact(0) 會 panic)
+    if is_string(ty) {
+        return ScanOutcome {
+            results: Vec::new(),
+            scanned_bytes: 0,
+        };
+    }
     let mut pagemap = Pagemap::open(pid);
     let page = pagemap
         .as_ref()
@@ -581,30 +729,121 @@ pub fn scan_ranges(pid: i32, ty: ValueType, filter: ScanFilter, maps: &[MapRegio
     }
 }
 
+/// 型別的位元數; BoolBit 視為 1 位元
+pub(crate) fn type_bits(ty: ValueType) -> u64 {
+    match ty {
+        ValueType::BoolBit => 1,
+        _ => (ty.size() * 8) as u64,
+    }
+}
+
+pub(crate) fn mask_bits(bits: u64) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
+}
+
+/// 凍結→預覽的窗口拆分 (僅 commit 時使用): 寬→窄把凍結值逐窗口切分為多個絕對候選
+/// (位址順序, 位元組窗口); 純從凍結 bits 推導, 不讀取記憶體。
+/// ps>=fs 時不展開 (擴展的基址與位於規格由 Expand 處理), 原樣回傳。
+pub fn expand_frozen(
+    frozen: &[ResultEntry],
+    frozen_ty: ValueType,
+    preview_ty: ValueType,
+) -> Vec<ResultEntry> {
+    let f = type_bits(frozen_ty);
+    let p = type_bits(preview_ty);
+    if f == 0 || p == 0 || p >= f {
+        return frozen.to_vec();
+    }
+    let q = f / p;
+    let mask = mask_bits(p);
+    let mut out = Vec::with_capacity(frozen.len() * q as usize);
+    for e in frozen {
+        for k in 0..q {
+            out.push(ResultEntry {
+                addr: e.addr + (k * p / 8),
+                bits: (e.bits >> (k * p)) & mask,
+                bit: if p < 8 { ((k * p) % 8) as u8 } else { 0 },
+                len: 0,
+            });
+        }
+    }
+    out
+}
+
+/// 篩選提交用的重建規格:
+/// 窄→寬時遮罩覆蓋 off 位移處的 f 個凍結位元窗口,
+/// 落地時位址改為新基址 (decay = off*f/8); 寬→窄 (拆分) 由 expand_frozen 處理, 回傳 None
+#[derive(Clone, Copy)]
+pub struct Expand {
+    /// 凍結位元窗口在預覽值內的遮罩
+    pub mask: u64,
+    /// 凍結位元窗口左移到預覽起點所需的位數
+    pub shift: u8,
+    /// 落地時位址減去的量 (以位元組計)
+    pub base_decay: u64,
+}
+
 pub fn refine_entries(
     pid: i32,
     ty: ValueType,
     filter: RefineFilter,
     entries: &[ResultEntry],
+    expand: Option<Expand>,
 ) -> Vec<ResultEntry> {
     let mut out = Vec::new();
     let size = ty.size();
     for entry in entries {
+        let base = entry.addr.wrapping_sub(expand.map(|e| e.base_decay).unwrap_or(0));
         let current = match ty {
             // Bit: 依位址重讀位元組, 再取 entry 自身的位元
-            ValueType::BoolBit => nb9::read_value(pid, entry.addr, 1)
+            ValueType::BoolBit => nb9::read_value(pid, base, 1)
                 .map(|v| (v >> entry.bit) & 1),
-            _ => nb9::read_value(pid, entry.addr, size),
-        };
-        if let Some(current) = current {
-            if refine_match(ty, filter, current, entry) {
-                out.push(ResultEntry {
-                    addr: entry.addr,
-                    bits: current,
-                    bit: entry.bit,
-                });
+            ValueType::StringUtf16 | ValueType::StringUtf8 => {
+                if entry.len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; entry.len as usize];
+                if !nb9::read(pid, base, &mut buf) {
+                    continue;
+                }
+                Some(string_hash(&buf))
             }
+            _ => nb9::read_value(pid, base, size),
+        };
+        let Some(current) = current else { continue };
+        let out_bit = if matches!(ty, ValueType::BoolBit) {
+            entry.bit
+        } else {
+            0
+        };
+        if let Some(spec) = expand {
+            let baseline = if spec.shift > 0 {
+                (current & !spec.mask) | ((entry.bits << spec.shift) & spec.mask)
+            } else {
+                (current & !spec.mask) | (entry.bits & spec.mask)
+            };
+            let frozen = ResultEntry {
+                addr: base,
+                bits: baseline,
+                bit: entry.bit,
+                len: entry.len,
+            };
+            if !refine_match(ty, filter, current, &frozen) {
+                continue;
+            }
+        } else if !refine_match(ty, filter, current, entry) {
+            continue;
         }
+        out.push(ResultEntry {
+            addr: base,
+            bits: current,
+            bit: out_bit,
+            len: entry.len,
+        });
     }
     out
 }
@@ -734,6 +973,7 @@ pub fn fuzzy_refine(pid: i32, base: FuzzyBase, mode: ChangeMode) -> FuzzyOutcome
             let keep = match mode {
                 ChangeMode::AnyChange => changed,
                 ChangeMode::Unchanged => !changed,
+                ChangeMode::Snapshot => true,
                 _ => changed,
             };
             if !keep {
@@ -764,7 +1004,7 @@ pub fn fuzzy_refine(pid: i32, base: FuzzyBase, mode: ChangeMode) -> FuzzyOutcome
 }
 
 /// 以常規結果對齊出分塊視圖: 每個結果位址 floor 到 block 起點, 去重後重讀算雜湊。
-/// 視圖只是呈現層投影, 不記錄候選值語意 (readable/hash 僅供顯示與對視圖做區塊篩選)。
+/// 視圖只是呈現層投影, 不記錄候選值語意 (readable/hash 僅供顯示)
 pub fn blocks_from_entries(pid: i32, maps: &[MapRegion], entries: &[ResultEntry], block_bytes: u64) -> FuzzyBase {
     use std::collections::HashSet;
     let kept: HashSet<u64> = entries
@@ -852,6 +1092,7 @@ pub fn fuzzy_to_entries(pid: i32, base: &FuzzyBase, ty: ValueType) -> (Vec<Resul
                                         addr,
                                         bits: (bits >> k) & 1,
                                         bit: k,
+                                        len: 0,
                                     });
                                 }
                             } else {
@@ -859,6 +1100,7 @@ pub fn fuzzy_to_entries(pid: i32, base: &FuzzyBase, ty: ValueType) -> (Vec<Resul
                                     addr,
                                     bits,
                                     bit: 0,
+                                    len: 0,
                                 });
                             }
                             scanned += size as u64;

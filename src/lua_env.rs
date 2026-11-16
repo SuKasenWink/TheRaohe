@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use mlua::{Function, Lua, Value};
+use serde::{Deserialize, Serialize};
 
 // 自瞄專用虛擬手指: 固定佔用第 9 槽 (1<<9), 不與使用者常用的低位槽競爭
 const AIM_TOUCH_SLOT: u16 = 1 << 9;
@@ -20,6 +21,9 @@ const AIM_TOUCH_SLOT: u16 = 1 << 9;
 pub struct LuaScript {
     // 先 drop 基準(持有 ValueRef), 再 drop Lua, 順序不能反
     baseline: Vec<(String, Value)>,
+    /// 腳本自身的默認值: exec 之後、apply_config 覆蓋 toon 之前的全域快照;
+    /// 「僅變化才記錄」以它為基準 — 腳本自建的變量自帶的值不算差異, 只有使用者真正改過的才入檔
+    defaults: Vec<(String, Value)>,
     pub file_name: String,
     pub lua: Lua,
     pub functions: Vec<String>,
@@ -45,7 +49,23 @@ pub struct DrawLine {
     pub color: [u8; 4],
 }
 
+/// Lua 立即模式畫文本: 直接畫到螢幕畫布背景層, 不附加任何窗口/佈局;
+/// 該次傳入只活到本幀結束, 腳本每 Tick 重畫。align_x/align_y 0..1 (0=文字左上貼錨點,
+/// 1=文字右下貼錨點, 0.5=置中); color 為 sRGB RGBA 位元組 (a 省略為 255);
+/// style: 0=Small (egui TextStyle::Small), 1=Body, 2=Heading (全省略 = 0)
+#[derive(Clone)]
+pub struct DrawText {
+    pub x: f32,
+    pub y: f32,
+    pub align_x: f32,
+    pub align_y: f32,
+    pub color: [u8; 4],
+    pub style: u8,
+    pub text: String,
+}
+
 static LINES: Mutex<Vec<DrawLine>> = Mutex::new(Vec::new());
+static TEXTS: Mutex<Vec<DrawText>> = Mutex::new(Vec::new());
 
 /// 排空由 UI 側呼叫: render() 每幀 + AppState::new 初始化後
 static CMDS: Mutex<Vec<LuaCmd>> = Mutex::new(Vec::new());
@@ -98,6 +118,10 @@ pub fn drain_cmds() -> Vec<LuaCmd> {
 
 pub fn take_lines() -> Vec<DrawLine> {
     LINES.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
+}
+
+pub fn take_texts() -> Vec<DrawText> {
+    TEXTS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
 }
 
 /// 庫 base 查找: path 含 needle (須已小寫) 的庫 base, 優先 offset==0 的映射
@@ -199,6 +223,38 @@ fn register_api(lua: &Lua) -> mlua::Result<()> {
     )?;
     t.set("draw_line", draw_line)?;
 
+    // 立即模式畫文本: 文本只存活到本幀結束, 腳本每 Tick 重畫; 直接畫在螢幕畫布背景層,
+    // 不附加任何窗口/佈局。座標為物理像素; align_* 鉗位到 0..1 (見 DrawText 註釋);
+    // r/g/b/a 0-255 向後可選, 僅省略尾部 a 為 255; style 可選: 0=Small 1=Body 2=Heading
+    let draw_text = lua.create_function(
+        |_, (x, y, align_x, align_y, text, r, g, b, a, style): (f64, f64, f64, f64, String, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<u8>)| {
+            let chan = |v: f64| v.clamp(0.0, 255.0).round() as u8;
+            let ax = align_x.clamp(0.0, 1.0) as f32;
+            let ay = align_y.clamp(0.0, 1.0) as f32;
+            let color = [
+                chan(r.unwrap_or(255.0)),
+                chan(g.unwrap_or(255.0)),
+                chan(b.unwrap_or(255.0)),
+                chan(a.unwrap_or(255.0)),
+            ];
+            if x.is_finite() && y.is_finite() {
+                if let Ok(mut q) = TEXTS.lock() {
+                    q.push(DrawText {
+                        x: x as f32,
+                        y: y as f32,
+                        align_x: ax,
+                        align_y: ay,
+                        color,
+                        style: style.unwrap_or(0).clamp(0, 2),
+                        text,
+                    });
+                }
+            }
+            Ok(())
+        },
+    )?;
+    t.set("draw_text", draw_text)?;
+
     macro_rules! read_int {
         ($name:literal, $size:expr, $ty:ty) => {{
             let f = lua.create_function(|_, addr: u64| -> mlua::Result<Value> {
@@ -274,8 +330,15 @@ fn register_api(lua: &Lua) -> mlua::Result<()> {
     })?;
     t.set("screen_size", screen_size)?;
 
-    // 自瞄手指: 屏幕物理像素座標, 絕對定位; driver 佈局依當前 rotation 決定 (init 會隨之重設)
-    // 呼叫成功回傳 true, 目標未就緒/驅動拒絕回傳 false
+    // 單調時鐘: 啟動至今的秒數 (f64); 腳本內部定時用 (連點間隙), 不做掛鐘時間
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = lua.create_function(|_, ()| -> mlua::Result<f64> {
+        Ok(EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs_f64())
+    })?;
+    t.set("now", now)?;
+
+    // 虛擬手指: 屏幕物理像素座標, 絕對定位; driver 佈局依當前 rotation 決定 (init 會隨之重設)
+    // 第三參數 finger = 手指槽索引 0..9, 省略 = 自瞄槽 9; 呼叫成功回傳 true, 目標未就緒/驅動拒絕回傳 false
     // 0 = 未初始化; 非零 = 當前已 init 的 rotation
     static AIM_TOUCH_LAYOUT: AtomicU32 = AtomicU32::new(0);
     fn ensure_touch_init(rot: u32) -> bool {
@@ -292,21 +355,27 @@ fn register_api(lua: &Lua) -> mlua::Result<()> {
         }
         ok
     }
-    // landscape 下 w (2400) = 未旋轉手機的螢幕高; 反射 X 軸即 yi = w - x
-    let pt_w = crate::display::screen_wh().map(|(w, _)| w as f64).unwrap_or(2400.0);
-    // 未旋轉手機的螢幕闊度 = landscape 高度 = h (1080)
-    let pt_h = crate::display::screen_wh().map(|(_, h)| h as f64).unwrap_or(1080.0);
     // rotation=3 (充電口在左) 已對齊: 軸向互換 + X 軸反彈;
     // rotation=1 (充電口在右) 直送原始值, 待使用者確認偏移方向後再精修
     // 其餘 rotation 的觸控不輸出
     const AIM_ALLOWED_ROTATION: u32 = 3;
     const AIM_RAW_ROTATION: u32 = 1;
     let mk_touch = |cmd: u32| {
-        lua.create_function(move |_, (x, y): (f64, f64)| -> mlua::Result<bool> {
+        lua.create_function(move |_, (x, y, finger): (f64, f64, Option<u8>)| -> mlua::Result<bool> {
             if !x.is_finite() || !y.is_finite() {
                 return Ok(false);
             }
             let rot = crate::display::rotation();
+            // 橫向尺寸每次呼叫都現取: 方向一旦改變, 不能被腳本載入時刻的快照拖住
+            let (sw, sh) = crate::display::screen_wh().unwrap_or((2400, 1080));
+            let pt_w = f64::from(sw);
+            let pt_h = f64::from(sh);
+            // 手指槽索引 0..9 (省略 = 自瞄槽 9); 傳錯回傳 false 靜默
+            let slot_mask = match finger {
+                Some(f) if u16::from(f) < crate::nb9::NB9_TOUCH_SLOTS => 1u16 << f,
+                Some(_) => return Ok(false),
+                None => AIM_TOUCH_SLOT,
+            };
             let (xi, yi) = match rot {
                 AIM_ALLOWED_ROTATION => (
                     y.clamp(0.0, f64::from(u32::MAX)) as u32,
@@ -319,7 +388,7 @@ fn register_api(lua: &Lua) -> mlua::Result<()> {
                 ),
                 _ => return Ok(false),
             };
-            Ok(ensure_touch_init(rot) && crate::nb9::touch_event(cmd, xi, yi, AIM_TOUCH_SLOT))
+            Ok(ensure_touch_init(rot) && crate::nb9::touch_event(cmd, xi, yi, slot_mask))
         })
     };
     t.set("touch_down", mk_touch(crate::nb9::TOUCH_DOWN)?)?;
@@ -328,6 +397,131 @@ fn register_api(lua: &Lua) -> mlua::Result<()> {
 
     lua.globals().set("theraohe", t)?;
     Ok(())
+}
+
+/// Lua 設置持久化: 每個腳本一份 `Lua/<腳本名>.toon`, 僅存反射變量(Integer/Number/Boolean/String)
+/// 與腳本自身默認不同的值; 由 lua_env 內部讀寫, 不給 Lua 開放檔案能力
+#[derive(Serialize, Deserialize)]
+struct PersistedLuaConfig {
+    variables: Vec<PersistedLuaVar>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedLuaVar {
+    name: String,
+    value: LuaScalar,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum LuaScalar {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+}
+
+fn config_path(dir: &std::path::Path, file_name: &str) -> PathBuf {
+    let stem = file_name.strip_suffix(".lua").unwrap_or(file_name);
+    dir.join(format!("{stem}.toon"))
+}
+
+/// 載入腳本後覆蓋其全域變量: 只對載入後仍然存在的 Integer/Number/Boolean/String globals 生效,
+/// 過期條目靜默忽略, 下次存檔時自然消除
+fn apply_config(script: &mut LuaScript) {
+    let Some(dir) = dir() else {
+        return;
+    };
+    let path = config_path(&dir, &script.file_name);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+    match toon_format::decode_default::<PersistedLuaConfig>(&text) {
+        Ok(cfg) => {
+            for var in cfg.variables {
+                // Integer/Number globals 對 Int/Float scalar 兩向相容 (腳本型別決定不了值型別);
+                // Boolean/String 嚴格對型
+                let ok = match (script.lua.globals().get::<Value>(var.name.as_str()), &var.value) {
+                    (Ok(Value::Integer(_) | Value::Number(_)), LuaScalar::Int(x)) => {
+                        script.lua.globals().set(var.name.as_str(), *x)
+                    }
+                    (Ok(Value::Integer(_) | Value::Number(_)), LuaScalar::Float(x)) => {
+                        script.lua.globals().set(var.name.as_str(), *x)
+                    }
+                    (Ok(Value::Boolean(_)), LuaScalar::Bool(x)) => {
+                        script.lua.globals().set(var.name.as_str(), *x)
+                    }
+                    (Ok(Value::String(_)), LuaScalar::String(x)) => {
+                        match script.lua.create_string(x) {
+                            Ok(s) => script.lua.globals().set(var.name.as_str(), s),
+                            Err(e) => {
+                                script.error = Some(format!("{name}: {e}", name = var.name));
+                                continue;
+                            }
+                        }
+                    }
+                    _ => continue,
+                };
+                if let Err(e) = ok {
+                    eprintln!("[lua] 配置寫回失敗 {}: {e}", path.display());
+                }
+            }
+        }
+        Err(e) => eprintln!("[lua] 配置解析失敗 {}: {e}", path.display()),
+    }
+}
+
+pub(crate) fn save_configs(scripts: &[LuaScript]) {
+    let Some(dir) = dir() else {
+        return;
+    };
+    for script in scripts {
+        let path = config_path(&dir, &script.file_name);
+        let mut vars: Vec<PersistedLuaVar> = Vec::new();
+        for pair in script.lua.globals().pairs::<Value, Value>() {
+            let Ok((Value::String(k), v)) = pair else {
+                continue;
+            };
+            let scalar = match &v {
+                Value::Integer(x) => LuaScalar::Int(*x),
+                Value::Number(x) => LuaScalar::Float(*x),
+                Value::Boolean(x) => LuaScalar::Bool(*x),
+                Value::String(x) => LuaScalar::String(x.to_string_lossy()),
+                _ => continue,
+            };
+            let name = k.to_string_lossy();
+            // 與腳本自身默認相同 → 不記錄(使用者沒改過, 也未必曾記錄進 toon)
+            let unchanged = script
+                .defaults
+                .iter()
+                .any(|(bk, bv)| *bk == name && *bv == v);
+            if unchanged {
+                continue;
+            }
+            vars.push(PersistedLuaVar { name, value: scalar });
+        }
+        // 沒有自定義 → 不留文件
+        if vars.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        vars.sort_by(|a, b| a.name.cmp(&b.name));
+        let cfg = PersistedLuaConfig { variables: vars };
+        match toon_format::encode_default(&cfg) {
+            Ok(text) => {
+                let tmp = path.with_extension("toon.tmp");
+                match std::fs::write(&tmp, &text).and_then(|()| std::fs::rename(&tmp, &path)) {
+                    Ok(()) => (),
+                    Err(e) => eprintln!("[lua] 配置寫入失敗 {}: {e}", path.display()),
+                }
+            }
+            Err(e) => eprintln!("[lua] 配置編碼失敗 {}: {e}", path.display()),
+        }
+    }
 }
 
 pub fn dir() -> Option<PathBuf> {
@@ -361,7 +555,14 @@ fn load_one(path: &std::path::Path) -> LuaScript {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "?.lua".to_string());
-    let lua = Lua::new();
+    // 腳本跑在系統最高權限, 且能寫回本行程記憶體, 「沙盒」不是安全邊界;
+    // 需要 debug.getlocal 讀形參名 (xy 函式反射), 因此連同 unsafe DEBUG 一起開
+    let lua = unsafe {
+        Lua::unsafe_new_with(
+            mlua::StdLib::ALL_SAFE | mlua::StdLib::DEBUG,
+            mlua::LuaOptions::default(),
+        )
+    };
     let api_error = register_api(&lua).err().map(|e| format!("內建 API 註冊失敗: {e}"));
     let baseline = snapshot_globals(&lua);
     // lua.load 不經過 luaL_loadfilex, 需自行剝 UTF-8 BOM, 否則記事本等編輯器存的檔直接語法錯誤
@@ -374,14 +575,19 @@ fn load_one(path: &std::path::Path) -> LuaScript {
                 .map_err(|e| e.to_string())
         })
         .err();
+    // 腳本自身的默認值在 exec 之後、apply_config 之前拍快照:
+    // 它既包含腳本自建變量的字面默認, 也包含完整的 stdlib; 與 baseline 的作用不同
+    let defaults = snapshot_globals(&lua);
     let mut script = LuaScript {
         baseline,
+        defaults,
         file_name,
         lua,
         functions: Vec::new(),
         variables: Vec::new(),
         error: error.or(api_error),
     };
+    apply_config(&mut script);
     refresh_reflection(&mut script);
     script
 }
@@ -397,6 +603,18 @@ fn snapshot_globals(lua: &Lua) -> Vec<(String, Value)> {
         .collect()
 }
 
+// xy 函式判定: 兩參數且形參名必為 x,y (debug.getlocal 讀形參表; C 函式/變參不計入)
+fn is_xy_signature(lua: &Lua, f: &Function) -> bool {
+    const CHUNK: &str = r#"
+        local f = ...
+        local n1 = debug.getlocal(f, 1)
+        local n2 = debug.getlocal(f, 2)
+        if n1 ~= "x" or n2 ~= "y" then return false end
+        return debug.getlocal(f, 3) == nil
+    "#;
+    lua.load(CHUNK).call::<bool>((f,)).unwrap_or(false)
+}
+
 fn refresh_reflection(script: &mut LuaScript) {
     let current = snapshot_globals(&script.lua);
     let mut functions = Vec::new();
@@ -410,11 +628,11 @@ fn refresh_reflection(script: &mut LuaScript) {
             continue;
         }
         match &value {
-            Value::Function(f) => {
-                if f.info().num_params == 0 {
-                    functions.push(name);
-                }
-            }
+            Value::Function(f) => match f.info().num_params {
+                0 => functions.push(name),
+                2 if is_xy_signature(&script.lua, f) => functions.push(name),
+                _ => {}
+            },
             _ => variables.push(name),
         }
     }
@@ -424,43 +642,68 @@ fn refresh_reflection(script: &mut LuaScript) {
     script.variables = variables;
 }
 
-/// 按鈕呼叫: 無參數呼叫全局函式; 錯誤寫入 script.error 供 UI 顯示
-pub fn call(script: &mut LuaScript, name: &str) {
-    let result = (|| -> mlua::Result<()> {
+/// 按鈕呼叫: 依 num_params 決定傳參 (0 → 無參; 2 → 若給了 (x, y) 帶 xy, 否則無參);
+/// 成功回函式 reply; 失敗回 None 且 script.error 設值 (Lua 頁可見)
+pub fn call(script: &mut LuaScript, name: &str, args: Option<(f64, f64)>) -> Option<Value> {
+    let result = (|| -> mlua::Result<Value> {
         let func: Function = script.lua.globals().get(name)?;
-        func.call::<()>(())
+        match func.info().num_params {
+            0 => func.call::<Value>(()),
+            2 => match args {
+                Some((x, y)) => func.call::<Value>((x, y)),
+                None => func.call::<Value>(()),
+            },
+            _ => Err(mlua::Error::RuntimeError(format!(
+                "{name} 參數個數不受支援 (需 0 或 x,y)"
+            ))),
+        }
     })();
     match result {
-        Ok(()) => {
+        Ok(v) => {
             // 呼叫可能增刪全局, 重算反射
             refresh_reflection(script);
             script.error = None;
+            Some(v)
         }
-        Err(e) => script.error = Some(format!("{name}: {e}")),
+        Err(e) => {
+            script.error = Some(format!("{name}: {e}"));
+            None
+        }
     }
+}
+
+/// 0 參函式判定 (開關式捷徑探測只對 0 參函式做無參呼叫)
+pub fn is_zero_arg_function(script: &LuaScript, name: &str) -> bool {
+    matches!(
+        script.lua.globals().get::<Value>(name),
+        Ok(Value::Function(f)) if f.info().num_params == 0
+    )
 }
 
 /// Tick() 約定: 每次硬體垂直同步中斷呼叫一次;
 /// 非零參/不存在則靜默跳過, 錯誤寫入 script.error 供 UI 顯示
 pub fn call_tick(script: &mut LuaScript) {
-    let is_zero_arg_fn = matches!(
-        script.lua.globals().get::<Value>("Tick"),
-        Ok(Value::Function(f)) if f.info().num_params == 0
-    );
-    if is_zero_arg_fn {
-        call(script, "Tick");
+    if call_zero_arg(script, "Tick") {
+        // 反射已刷新
     }
 }
 
 /// Begin() 約定: 宿主(egui)就緒且行程表掃描完成後自動呼叫一次;
 /// 非零參/不存在則靜默跳過, 錯誤寫入 script.error 供 UI 顯示
 pub fn call_begin(script: &mut LuaScript) {
+    call_zero_arg(script, "Begin");
+}
+
+fn call_zero_arg(script: &mut LuaScript, name: &str) -> bool {
     let is_zero_arg_fn = matches!(
-        script.lua.globals().get::<Value>("Begin"),
+        script.lua.globals().get::<Value>(name),
         Ok(Value::Function(f)) if f.info().num_params == 0
     );
     if is_zero_arg_fn {
-        call(script, "Begin");
+        let _ = call(script, name, None);
+        true
+    } else {
+        false
     }
 }
 
@@ -473,3 +716,4 @@ pub fn set_global(script: &mut LuaScript, name: &str, value: Value) {
         Err(e) => script.error = Some(format!("{name}: {e}")),
     }
 }
+
