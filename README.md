@@ -38,9 +38,9 @@ cargo xtask deploy --restart  # 先 pkill 再部署 (推薦)
 - 安裝 MT Manager (或任一支援 root 的檔案管理器)
 - 瀏覽器下載 `theraohe.tar.gz` (預設落在 `/sdcard/Download/`)
 
-1. MT Manager 開啟 `/sdcard/Download/theraohe.tar.gz`, 解壓到 `/data/local/tmp/` (需 root)
+1. MT Manager 開啟 `/sdcard/Download/theraohe.tar.gz`, 解壓到 `/data/local/tmp/`
 2. 以 root 身份執行 `/data/local/tmp/theraohe/Start.sh`
-3. 螢幕上將出現疊加界面
+3. 螢幕上出現疊加界面即成功
 
 不想用 MT Manager 的話, 也可以用 Termux:
     ```bash

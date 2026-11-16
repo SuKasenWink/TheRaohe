@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,5 +18,9 @@ jobs:
         with:
           targets: aarch64-linux-android
 
-      - name: cargo check
-        run: cargo check --target aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+
+      # cargo check 跑不起 mlua 的 C 編譯: build script 需要 NDK clang;
+      # 與開發環境同款指令 (xtask 自動偵測 NDK 並設定 CC/AR/linker)
+      - name: cargo xtask build
+        run: cargo xtask build
