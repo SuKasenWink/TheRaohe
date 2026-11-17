@@ -1,14 +1,13 @@
-﻿use egui_on_screen_ime_temp::Clipboard;
-use egui_on_screen_ime_temp::Keyboard;
 use crate::lua_env;
 use crate::maps::{self, MapRegion};
 use crate::mem::{self, ChangeMode, ProcInfo, ResultEntry, ValueType};
 use egui::{
-    vec2, Align, Button, CollapsingHeader, Color32,     FontData, FontDefinitions, FontFamily,
-    FontTweak, Frame, Layout, RadioButton, RichText, ScrollArea, TextWrapMode, Vec2,
+    vec2, Align, Button, CollapsingHeader, Color32, FontData, FontDefinitions, FontFamily, Frame,
+    Layout, RadioButton, RichText, ScrollArea, TextWrapMode, Vec2,
 };
-use egui::epaint::text::VariationCoords;
 use egui_extras::{Column, TableBuilder};
+use egui_on_screen_ime_temp::Clipboard;
+use egui_on_screen_ime_temp::Keyboard;
 use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -131,7 +130,14 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [Tab::Proc, Tab::Maps, Tab::Scan, Tab::Hex, Tab::Lua, Tab::Settings];
+    pub const ALL: [Tab; 6] = [
+        Tab::Proc,
+        Tab::Maps,
+        Tab::Scan,
+        Tab::Hex,
+        Tab::Lua,
+        Tab::Settings,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -1044,13 +1050,30 @@ fn move_chip(state: &mut AppState, from: ChipLocation, mut to: ChipLocation) {
         // 同列插入: 若目標在原位之右, 先行移除會讓目標左移一格
         to.chip = to.chip.saturating_sub((from.chip < to.chip) as usize);
     }
-    let chip = match chip_vec(state, RowLocation { group: from.group, row: from.row })
-        .and_then(|v| if from.chip < v.len() { Some(v.remove(from.chip)) } else { None })
-    {
+    let chip = match chip_vec(
+        state,
+        RowLocation {
+            group: from.group,
+            row: from.row,
+        },
+    )
+    .and_then(|v| {
+        if from.chip < v.len() {
+            Some(v.remove(from.chip))
+        } else {
+            None
+        }
+    }) {
         Some(c) => c,
         None => return,
     };
-    if let Some(dest) = chip_vec(state, RowLocation { group: to.group, row: to.row }) {
+    if let Some(dest) = chip_vec(
+        state,
+        RowLocation {
+            group: to.group,
+            row: to.row,
+        },
+    ) {
         to.chip = to.chip.min(dest.len());
         dest.insert(to.chip, chip);
     }
@@ -1110,7 +1133,10 @@ pub(crate) fn apply_lua_cmds(state: &mut AppState) {
                     .find(|p| p.name.eq_ignore_ascii_case(&name))
                     .or_else(|| {
                         let needle = name.to_ascii_lowercase();
-                        state.procs.iter().find(|p| p.name.to_ascii_lowercase().contains(&needle))
+                        state
+                            .procs
+                            .iter()
+                            .find(|p| p.name.to_ascii_lowercase().contains(&needle))
                     })
                     .map(|p| p.pid);
                 match found {
@@ -1281,8 +1307,7 @@ fn selected_maps(state: &AppState) -> Vec<MapRegion> {
         .iter()
         .enumerate()
         .filter(|(i, map)| {
-            state.map_checked.get(*i).copied().unwrap_or(false)
-                && !maps::is_absolute_excluded(map)
+            state.map_checked.get(*i).copied().unwrap_or(false) && !maps::is_absolute_excluded(map)
         })
         .map(|(_, m)| m.clone())
         .collect()
@@ -1467,7 +1492,12 @@ pub(crate) fn start_scan(app: &Arc<Mutex<AppState>>) {
                 }
             ),
             mem::ScanFilter::Between { min, max } => {
-                format!("掃描 {} 範圍 {} ~ {} ...", ty.label(), ty.format(*min), ty.format(*max))
+                format!(
+                    "掃描 {} 範圍 {} ~ {} ...",
+                    ty.label(),
+                    ty.format(*min),
+                    ty.format(*max)
+                )
             }
         };
         state.bump();
@@ -1506,7 +1536,6 @@ pub(crate) fn start_scan(app: &Arc<Mutex<AppState>>) {
             state.bump();
         }
     });
-
 }
 
 pub(crate) fn start_refine(app: &Arc<Mutex<AppState>>) {
@@ -1584,7 +1613,14 @@ pub(crate) fn start_refine(app: &Arc<Mutex<AppState>>) {
         // 切分 (ps<fs): 先把凍結入口切成窗口候選再篩選; 擴展 (ps>fs): 維持重建基準比對
         let frozen = state.frozen_ty;
         let expand = expand_spec(frozen, ty, state.expand_off);
-        (state.pid, ty, filter, state.scan.typed.clone(), frozen, expand)
+        (
+            state.pid,
+            ty,
+            filter,
+            state.scan.typed.clone(),
+            frozen,
+            expand,
+        )
     };
     let app = Arc::clone(app);
     std::thread::spawn(move || {
@@ -1635,7 +1671,14 @@ pub(crate) fn start_typed_snapshot(app: &Arc<Mutex<AppState>>) {
         let ty = state.scan_slot.ty(state.signed);
         // 以絕對地址枚舉虛擬行 (切分後展開投影), 同目標集同鍵同序
         let targets: Vec<ResultEntry> = (0..state.preview_row_count())
-            .filter_map(|i| state.preview_row(i).map(|(addr, bit, _, len)| ResultEntry { addr, bits: 0, bit, len }))
+            .filter_map(|i| {
+                state.preview_row(i).map(|(addr, bit, _, len)| ResultEntry {
+                    addr,
+                    bits: 0,
+                    bit,
+                    len,
+                })
+            })
             .collect();
         state.scanning = true;
         state.status = "記錄快照…".to_string();
@@ -1648,8 +1691,9 @@ pub(crate) fn start_typed_snapshot(app: &Arc<Mutex<AppState>>) {
         let mut out = Vec::with_capacity(job.2.len());
         for e in &job.2 {
             let bits = match job.1 {
-                ValueType::BoolBit => crate::nb9::read_value(job.0, e.addr, 1)
-                    .map(|v| (v >> e.bit) & 1),
+                ValueType::BoolBit => {
+                    crate::nb9::read_value(job.0, e.addr, 1).map(|v| (v >> e.bit) & 1)
+                }
                 ValueType::StringUtf16 | ValueType::StringUtf8 => {
                     if e.len == 0 {
                         continue;
@@ -1666,7 +1710,11 @@ pub(crate) fn start_typed_snapshot(app: &Arc<Mutex<AppState>>) {
             out.push(ResultEntry {
                 addr: e.addr,
                 bits,
-                bit: if matches!(job.1, ValueType::BoolBit) { e.bit } else { 0 },
+                bit: if matches!(job.1, ValueType::BoolBit) {
+                    e.bit
+                } else {
+                    0
+                },
                 len: e.len,
             });
         }
@@ -1707,7 +1755,11 @@ fn refresh_results_silent(app: &Arc<Mutex<AppState>>) {
         let row_count = state.preview_row_count();
         // String 預覽需要 needle 長度; 由行映射一併帶上
         let targets: Vec<(u64, u8, u16)> = (0..row_count)
-            .filter_map(|i| state.preview_row(i).map(|(addr, bit, _, len)| (addr, bit, len)))
+            .filter_map(|i| {
+                state
+                    .preview_row(i)
+                    .map(|(addr, bit, _, len)| (addr, bit, len))
+            })
             .collect();
         (state.pid, ty, targets, state.results_epoch)
     };
@@ -1895,28 +1947,16 @@ impl UiHost {
         let data = std::fs::read(font_path).map_err(|e| format!("read {font_path}: {e}"))?;
         let mut fonts = FontDefinitions::default();
         let index = font_index.unwrap_or(0);
-        const GSC: &[u8] = include_bytes!("../assets/fonts/GoogleSansCode-VariableFont_MONO,wght.ttf");
         let noto = FontData::from_blob(Arc::new(data), index);
-        let gsc_prop = FontData::from_static(GSC).tweak(FontTweak {
-            coords: VariationCoords::new([(b"MONO", 0.0)]),
-            ..Default::default()
-        });
-        let gsc_mono = FontData::from_static(GSC).tweak(FontTweak {
-            coords: VariationCoords::new([(b"MONO", 1.0)]),
-            ..Default::default()
-        });
-        fonts.font_data.insert("noto-cjk".to_owned(), Arc::new(noto));
-        fonts.font_data.insert("google-sans-code-prop".to_owned(), Arc::new(gsc_prop));
-        fonts.font_data.insert("google-sans-code-mono".to_owned(), Arc::new(gsc_mono));
-        for (family, gsc) in [
-            (FontFamily::Proportional, "google-sans-code-prop"),
-            (FontFamily::Monospace, "google-sans-code-mono"),
-        ] {
+        fonts
+            .font_data
+            .insert("noto-cjk".to_owned(), Arc::new(noto));
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
             fonts
                 .families
                 .entry(family)
                 .or_default()
-                .splice(0..0, [gsc.to_owned(), "noto-cjk".to_owned()]);
+                .splice(0..0, ["noto-cjk".to_owned()]);
         }
         let ctx = egui::Context::default();
         ctx.set_fonts(fonts);
@@ -1947,7 +1987,11 @@ impl UiHost {
 
     /// 懶建立 GPU 後端; 失敗回傳 Err (已記錄狀態, 呼叫方應回落 CPU)
     /// swapchain 配成 max(w,h) x max(w,h), 與 ANativeWindow_setBuffersGeometry 的方形 layer 一致
-    fn ensure_gpu(&mut self, width: u32, height: u32) -> Result<&mut crate::gpu_render::GpuRenderer, String> {
+    fn ensure_gpu(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<&mut crate::gpu_render::GpuRenderer, String> {
         let side = width.max(height);
         if self.gpu.is_none() {
             if self.gpu_unavailable {
@@ -1956,7 +2000,13 @@ impl UiHost {
             if self.window == 0 {
                 return Err("尚未 set_window".to_string());
             }
-            match crate::gpu_render::GpuRenderer::new(self.window as *mut std::ffi::c_void, side, side, width, height) {
+            match crate::gpu_render::GpuRenderer::new(
+                self.window as *mut std::ffi::c_void,
+                side,
+                side,
+                width,
+                height,
+            ) {
                 Ok(g) => self.gpu = Some(g),
                 Err(e) => {
                     self.gpu_unavailable = true;
@@ -1984,7 +2034,19 @@ impl UiHost {
         if screen_w == 0 || screen_h == 0 {
             return RenderOutcome::Skip;
         }
-        let (revision, visible, events, scanning, want_capture, refresh_interval, hex_refresh_interval, results_len, interval_slot, hex_autorefresh, on_hex) = {
+        let (
+            revision,
+            visible,
+            events,
+            scanning,
+            want_capture,
+            refresh_interval,
+            hex_refresh_interval,
+            results_len,
+            interval_slot,
+            hex_autorefresh,
+            on_hex,
+        ) = {
             let mut state = match app.lock() {
                 Ok(v) => v,
                 Err(_) => return RenderOutcome::Skip,
@@ -2121,8 +2183,15 @@ impl UiHost {
         if matches!(render_backend, RenderBackend::Gpu) {
             match self.ensure_gpu(width as u32, height as u32) {
                 Ok(gpu) => {
-                    let outcome = match gpu.present(&primitives, out.textures_delta, out.pixels_per_point, want_capture) {
-                        Ok(crate::gpu_render::PresentOutcome::Presented) => RenderOutcome::Presented,
+                    let outcome = match gpu.present(
+                        &primitives,
+                        out.textures_delta,
+                        out.pixels_per_point,
+                        want_capture,
+                    ) {
+                        Ok(crate::gpu_render::PresentOutcome::Presented) => {
+                            RenderOutcome::Presented
+                        }
                         Ok(crate::gpu_render::PresentOutcome::Captured(px)) => {
                             spawn_screenshot(px, width, height, self.layer_offset, app);
                             RenderOutcome::Presented
@@ -2161,7 +2230,13 @@ impl UiHost {
             out.pixels_per_point,
         );
         if want_capture {
-            spawn_screenshot(buf[..width * height].to_vec(), width, height, self.layer_offset, app);
+            spawn_screenshot(
+                buf[..width * height].to_vec(),
+                width,
+                height,
+                self.layer_offset,
+                app,
+            );
         }
         RenderOutcome::Canvas
     }
@@ -2265,13 +2340,19 @@ fn paint_lua_draw(
             ],
             egui::Stroke::new(
                 inv,
-                egui::Color32::from_rgba_unmultiplied(line.color[0], line.color[1], line.color[2], line.color[3]),
+                egui::Color32::from_rgba_unmultiplied(
+                    line.color[0],
+                    line.color[1],
+                    line.color[2],
+                    line.color[3],
+                ),
             ),
         );
     }
     for t in texts {
         let anchor = egui::pos2(t.x * inv, t.y * inv);
-        let color = egui::Color32::from_rgba_unmultiplied(t.color[0], t.color[1], t.color[2], t.color[3]);
+        let color =
+            egui::Color32::from_rgba_unmultiplied(t.color[0], t.color[1], t.color[2], t.color[3]);
         let font = match t.style {
             1 => body.clone(),
             2 => heading.clone(),
@@ -2299,7 +2380,13 @@ fn spawn_screenshot(
         match &res {
             Ok(path) => {
                 let _ = std::process::Command::new("am")
-                    .args(["broadcast", "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE", "-d", &format!("file://{path}")])
+                    .args([
+                        "broadcast",
+                        "-a",
+                        "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                        "-d",
+                        &format!("file://{path}"),
+                    ])
                     .output();
             }
             Err(e) => eprintln!("[ui] screenshot failed: {e}"),
@@ -2361,7 +2448,10 @@ fn draw_ui(
     // 狀態欄高度按物理像素記錄, 佈局以邏輯座標, 需除以縮放
     let main_pos = egui::pos2(0.0, state.status_bar_h as f32 / ctx.pixels_per_point());
     let main_id = egui::Id::unique("theraohe-main");
-    if state.collapse_toggle.swap(false, std::sync::atomic::Ordering::Relaxed) {
+    if state
+        .collapse_toggle
+        .swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
         let collapsing_id = main_id.with("collapsing");
         if let Some(mut collapsed) =
             egui::containers::collapsing_header::CollapsingState::load(ctx, collapsing_id)
@@ -2405,7 +2495,10 @@ fn draw_ui(
                             ui.spacing_mut().item_spacing.x = gap;
                             for (label, action) in footer_labels {
                                 if ui
-                                    .add_sized([bw, ui.spacing().interact_size.y], Button::new(*label))
+                                    .add_sized(
+                                        [bw, ui.spacing().interact_size.y],
+                                        Button::new(*label),
+                                    )
                                     .clicked()
                                 {
                                     actions.push(action.clone());
@@ -2414,12 +2507,6 @@ fn draw_ui(
                         });
                     });
             }
-
-
-
-
-
-
 
             // 掃描控制面板（仿工具列直屬佈局，全屏分屏）
             // 依內容區比例切換: 闊/高 > 1 用左右分屏, 否則上下分屏
@@ -2480,12 +2567,16 @@ fn draw_ui(
                 continue;
             }
             let name = state.shortcut_groups[group_idx].name.clone();
-            let max_chips = rows_filled.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+            let max_chips = rows_filled
+                .iter()
+                .map(|r| r.len())
+                .max()
+                .unwrap_or(1)
+                .max(1);
             // 定值格寬, 窗口寬度只按最長列算; 追蹤內容/spacing 做到不外漲
             const ITEM_W: f32 = 140.0;
-            let default_w = max_chips as f32 * ITEM_W
-                + max_chips.saturating_sub(1) as f32 * 8.0
-                + 16.0;
+            let default_w =
+                max_chips as f32 * ITEM_W + max_chips.saturating_sub(1) as f32 * 8.0 + 16.0;
             let rows_n = rows_filled.len() as f32;
             let default_h = (rows_n * 96.0).max(80.0);
             // 捷徑窗口的位置/大小由使用者自己拖, 不與設置頁共享來源: 直接採納持久化 rect
@@ -2522,15 +2613,17 @@ fn draw_ui(
                         widget.weak_bg_fill = widget.weak_bg_fill.gamma_multiply(0.5);
                     }
                     let rows_n = rows_filled.len() as f32;
-                    let avail_h = ui.available_height();                    // 同 egui reference: 列高扣掉列間距後均分 — 不留剩餘空隙, 也不帶動窗口增長
-                    let row_h = ((avail_h - ui.spacing().item_spacing.y * (rows_n - 1.0)) / rows_n).max(0.0);
+                    let avail_h = ui.available_height(); // 同 egui reference: 列高扣掉列間距後均分 — 不留剩餘空隙, 也不帶動窗口增長
+                    let row_h = ((avail_h - ui.spacing().item_spacing.y * (rows_n - 1.0)) / rows_n)
+                        .max(0.0);
                     ui.vertical(|ui| {
                         for row in rows_filled.iter() {
                             ui.allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
                                 ui.columns(row.len(), |cols| {
                                     for (col, chip) in cols.iter_mut().zip(row) {
                                         // 開關式捷徑 (點擊後被判定為回 Bool 的按鈕): selectable 渲染且不進按壓積極呼叫
-                                        let toggle_on = state.shortcut_toggles.get(chip.as_str()).copied();
+                                        let toggle_on =
+                                            state.shortcut_toggles.get(chip.as_str()).copied();
                                         let resp = match toggle_on {
                                             Some(on) => col.add_sized(
                                                 col.available_size(),
@@ -2540,13 +2633,14 @@ fn draw_ui(
                                                 // 捷徑按鈕要「按住即持續」, 手指滑動不能被 egui 當成取消點擊 —
                                                 // 走 click_and_drag sense (key for 自瞄按住)
                                                 col.available_size(),
-                                                Button::new(chip).sense(egui::Sense::click_and_drag()),
+                                                Button::new(chip)
+                                                    .sense(egui::Sense::click_and_drag()),
                                             ),
                                         };
                                         if resp.is_pointer_button_down_on() && toggle_on.is_none() {
-                                            let pos = resp
-                                                .interact_pointer_pos()
-                                                .map(|p| (f64::from(p.x * ppp), f64::from(p.y * ppp)));
+                                            let pos = resp.interact_pointer_pos().map(|p| {
+                                                (f64::from(p.x * ppp), f64::from(p.y * ppp))
+                                            });
                                             shortcut_held.push((chip.clone(), pos));
                                         }
                                         if resp.clicked() {
@@ -2557,25 +2651,38 @@ fn draw_ui(
                                                     state
                                                         .lua_scripts
                                                         .iter()
-                                                        .find(|s| s.file_name == format!("{stem}.lua"))
-                                                        .filter(|s| lua_env::is_zero_arg_function(s, &function))
+                                                        .find(|s| {
+                                                            s.file_name == format!("{stem}.lua")
+                                                        })
+                                                        .filter(|s| {
+                                                            lua_env::is_zero_arg_function(
+                                                                s, &function,
+                                                            )
+                                                        })
                                                         .map(|_| (stem, function))
                                                 })
                                                 .and_then(|(stem, function)| {
                                                     state
                                                         .lua_scripts
                                                         .iter_mut()
-                                                        .find(|s| s.file_name == format!("{stem}.lua"))
+                                                        .find(|s| {
+                                                            s.file_name == format!("{stem}.lua")
+                                                        })
                                                         .map(|s| (s, function))
                                                 })
-                                                .and_then(|(s, function)| lua_env::call(s, &function, None))
+                                                .and_then(|(s, function)| {
+                                                    lua_env::call(s, &function, None)
+                                                })
                                                 .and_then(|v| match v {
                                                     mlua::Value::Boolean(b) => Some(b),
                                                     _ => None,
                                                 });
                                             if let Some(b) = toggled {
                                                 state.shortcut_toggles.insert(chip.clone(), b);
-                                            } else if !state.shortcut_toggles.contains_key(chip.as_str()) {
+                                            } else if !state
+                                                .shortcut_toggles
+                                                .contains_key(chip.as_str())
+                                            {
                                                 if let Some(a) = shortcut_trigger(chip) {
                                                     actions.push(a);
                                                 }
@@ -2596,13 +2703,14 @@ fn draw_ui(
 
     if state.console_open {
         let mut console_open = true;
-        let console_pos = egui::pos2(screen.width() * 0.05, screen.height() * 0.55);
+        let console_side = screen.width().min(screen.height());
+        let console_pos = egui::pos2(screen.width() * 0.5, screen.height() * 0.5);
         if let Some(r) = egui::Window::new("終端台")
             .id(egui::Id::unique("theraohe-console"))
             .collapsible(true)
             .resizable(true)
             .default_pos(console_pos)
-            .default_size(vec2(screen.width() * 0.9, screen.height() * 0.35))
+            .default_size(vec2(console_side * 0.75, console_side * 0.6))
             .min_size(vec2(160.0, 80.0))
             .max_size(vec2(screen.width(), screen.height()))
             .constrain(true)
@@ -2657,9 +2765,7 @@ fn draw_ui(
 
 fn equal_row(ui: &mut egui::Ui, n: usize, add: impl FnOnce(&mut [egui::Ui])) {
     let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
-    ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
-        ui.columns(n, add)
-    });
+    ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| ui.columns(n, add));
 }
 
 fn draw_toolbar(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
@@ -2745,7 +2851,10 @@ fn draw_procs(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) 
                     let selected = state.pid == pid;
                     let text = format!("{name} | {pid}");
                     if ui
-                        .add_sized([w, ui.spacing().interact_size.y], Button::selectable(selected, text))
+                        .add_sized(
+                            [w, ui.spacing().interact_size.y],
+                            Button::selectable(selected, text),
+                        )
                         .clicked()
                     {
                         actions.push(UiAction::Attach(pid));
@@ -2827,17 +2936,14 @@ fn draw_maps(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
                 row.col(|ui| {
                     let text = format!("{:012x}-{:012x}", map.start, map.end);
                     ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(text).monospace().color(text_color),
-                        )
-                        .truncate(),
+                        egui::Label::new(egui::RichText::new(text).monospace().color(text_color))
+                            .truncate(),
                     );
                 });
                 row.col(|ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            egui::RichText::new(format_size(map.end - map.start))
-                                .color(text_color),
+                            egui::RichText::new(format_size(map.end - map.start)).color(text_color),
                         );
                     });
                 });
@@ -2882,11 +2988,7 @@ fn draw_type_grid(
     });
 }
 
-fn draw_typed_input(
-    ui: &mut egui::Ui,
-    state: &AppState,
-    actions: &mut Vec<UiAction>,
-) {
+fn draw_typed_input(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
     if state.scan_slot == TypeSlot::Bool || state.scan_slot == TypeSlot::Bit {
         let mut checked = state.input == "1";
         let label = if checked { "True" } else { "False" };
@@ -2939,7 +3041,11 @@ fn draw_scan_controls(
             let insufficient = available.is_some_and(|a| estimate > a);
             let text_color = ui.visuals().text_color();
             ui.horizontal_wrapped(|ui| {
-                let color = if insufficient { CHANGED_COLOR } else { text_color };
+                let color = if insufficient {
+                    CHANGED_COLOR
+                } else {
+                    text_color
+                };
                 ui.label(egui::RichText::new(estimate_text).color(color));
                 if let Some(base) = &state.scan.blocks {
                     ui.label(format!(
@@ -2949,15 +3055,12 @@ fn draw_scan_controls(
                     ));
                 }
             });
-            let refine_enabled =
-                !state.scan.typed.is_empty() || state.scan.blocks.is_some();
+            let refine_enabled = !state.scan.typed.is_empty() || state.scan.blocks.is_some();
             equal_row(ui, 2, |cols| {
                 let refine = cols[0]
                     .centered_and_justified(|ui| {
-                        ui.add_enabled_ui(refine_enabled, |ui| {
-                            ui.button("篩選結果").clicked()
-                        })
-                        .inner
+                        ui.add_enabled_ui(refine_enabled, |ui| ui.button("篩選結果").clicked())
+                            .inner
                     })
                     .inner;
                 let scan = cols[1]
@@ -3045,7 +3148,6 @@ fn draw_scan_controls(
                 ui.label(format!("對中… {} 處理中", SPINNER[spinner]));
             }
         });
-
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -3056,7 +3158,10 @@ fn condition_row(
     actions: &mut Vec<UiAction>,
     mode: ChangeMode,
 ) {
-    let bool_slot = matches!(state.scan_slot.ty(state.signed), ValueType::Bool | ValueType::BoolBit);
+    let bool_slot = matches!(
+        state.scan_slot.ty(state.signed),
+        ValueType::Bool | ValueType::BoolBit
+    );
     let label = mode.label();
     let selected = state.change_mode == mode;
     let is_range = mode == ChangeMode::Between;
@@ -3090,20 +3195,36 @@ fn condition_row(
                         (egui::TextStyle::Body.resolve(s), ui.visuals().text_color())
                     };
                     let measure = |text: &str| {
-                        ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font_id.clone(), text_color).size().x)
+                        ui.fonts_mut(|f| {
+                            f.layout_no_wrap(text.to_string(), font_id.clone(), text_color)
+                                .size()
+                                .x
+                        })
                     };
                     // TextEdit 無 content-autosize, 按文字寬量出 desired_width 來貼齊內容; DragValue 由 egui 自動量
-                    let field_w = |text: &str, hint: &str| (measure(text).max(measure(hint)) + 16.0).max(48.0);
+                    let field_w = |text: &str, hint: &str| {
+                        (measure(text).max(measure(hint)) + 16.0).max(48.0)
+                    };
                     let min_w = field_w(&state.range_min, "Min");
                     let max_w = field_w(&state.range_max, "Max");
                     let mut min = state.range_min.clone();
-                    let resp = ui.add(egui::TextEdit::singleline(&mut min).hint_text("Min").char_limit(32).desired_width(min_w));
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut min)
+                            .hint_text("Min")
+                            .char_limit(32)
+                            .desired_width(min_w),
+                    );
                     if resp.changed() {
                         actions.push(UiAction::SetRangeMin(min));
                     }
                     changed |= resp.changed();
                     let mut max = state.range_max.clone();
-                    let resp = ui.add(egui::TextEdit::singleline(&mut max).hint_text("Max").char_limit(32).desired_width(max_w));
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut max)
+                            .hint_text("Max")
+                            .char_limit(32)
+                            .desired_width(max_w),
+                    );
                     if resp.changed() {
                         actions.push(UiAction::SetRangeMax(max));
                     }
@@ -3119,11 +3240,7 @@ fn condition_row(
 
 /// 數值輸入一律 DragValue; state.input 為單一真相 (拖拉後寫回新的數字字串).
 /// 解析失敗退回 0; 整數依型別位寬與符號做飽和夾制.
-fn draw_numeric_drag(
-    ui: &mut egui::Ui,
-    state: &AppState,
-    actions: &mut Vec<UiAction>,
-) -> bool {
+fn draw_numeric_drag(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) -> bool {
     let ty = state.scan_slot.ty(state.signed);
     let raw = state.input.trim();
     match ty {
@@ -3155,7 +3272,11 @@ fn draw_numeric_drag(
         }
         ValueType::Ptr => {
             let mut v: u64 = ty.parse(raw).unwrap_or(0);
-            let resp = ui.add(egui::DragValue::new(&mut v).speed(1.0).hexadecimal(10, false, false));
+            let resp = ui.add(
+                egui::DragValue::new(&mut v)
+                    .speed(1.0)
+                    .hexadecimal(10, false, false),
+            );
             if resp.changed() {
                 actions.push(UiAction::SetInput(format!("0x{v:x}")));
             }
@@ -3199,7 +3320,8 @@ fn estimate_scan_bytes(slot: TypeSlot, span_bytes: u64) -> u64 {
     match slot.interval_block_bytes() {
         Some(block) => {
             let blocks = span_bytes.saturating_add(block - 1) / block;
-            blocks.saturating_mul(FUZZY_RECORD_BYTES)
+            blocks
+                .saturating_mul(FUZZY_RECORD_BYTES)
                 .saturating_add(FUZZY_SCAN_BUFFER)
         }
         None => FUZZY_SCAN_BUFFER,
@@ -3220,7 +3342,10 @@ fn condition_mode_enabled(state: &AppState, mode: ChangeMode) -> bool {
     let ty = state.scan_slot.ty(state.signed);
     let same = ty == state.frozen_ty;
     // bool/bit 與 string 只有「變化 / 原樣」語意 (string 比對精確位元組, 無定量增減)
-    let bool_like = matches!(ty, ValueType::Bool | ValueType::BoolBit | ValueType::StringUtf16 | ValueType::StringUtf8);
+    let bool_like = matches!(
+        ty,
+        ValueType::Bool | ValueType::BoolBit | ValueType::StringUtf16 | ValueType::StringUtf8
+    );
     match mode {
         // 記錄快照: 任何時機可用
         ChangeMode::Snapshot => true,
@@ -3310,7 +3435,8 @@ fn draw_fuzzy_results(ui: &mut egui::Ui, base: &mem::FuzzyBase) {
                         );
                     });
                     row.col(|ui| {
-                        let mut text = egui::RichText::new(format!("0x{:016x}", block.hash)).monospace();
+                        let mut text =
+                            egui::RichText::new(format!("0x{:016x}", block.hash)).monospace();
                         if block.changed {
                             text = text.color(CHANGED_COLOR);
                         }
@@ -3367,13 +3493,21 @@ fn draw_results(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>
                         let off = state.expand_off.min(opts - 1);
                         egui::ComboBox::from_id_salt("expand-offset")
                             .width(80.0)
-                            .selected_text(format!("{}@{}", compact_type_label(preview), expand_label(off)))
+                            .selected_text(format!(
+                                "{}@{}",
+                                compact_type_label(preview),
+                                expand_label(off)
+                            ))
                             .show_ui(ui, |ui| {
                                 for i in 0..opts {
                                     if ui
                                         .selectable_label(
                                             i == off,
-                                            format!("{}@{}", compact_type_label(preview), expand_label(i)),
+                                            format!(
+                                                "{}@{}",
+                                                compact_type_label(preview),
+                                                expand_label(i)
+                                            ),
                                         )
                                         .clicked()
                                         && i != off
@@ -3424,149 +3558,143 @@ fn draw_results(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>
     // 併進父 min_rect, 分隔線會穿透底欄, 故表格包一層 scope 隔離
     ui.scope(|ui| {
         TableBuilder::new(ui)
-        .striped(true)
-        .resizable(true)
-        .vscroll(true)
-        .sense(egui::Sense::click())
-        .drag_to_scroll(egui::scroll_area::DragScroll::Always)
-        .column(Column::initial(addr_w).at_least(40.0).clip(true))
-        .column(Column::initial(raw_w).at_least(40.0).clip(true))
-        .column(Column::remainder().at_least(40.0).clip(true))
-        .header(20.0, |mut header| {
-            header.col(|ui| {
-                ui.label("位址");
-            });
-            header.col(|ui| {
-                ui.label("值");
-            });
-            header.col(|ui| {
-                ui.label("解析值");
-            });
-        })
-        .body(|body| {
-            body.rows(row_h, row_count, |mut row| {
-                let idx = row.index();
-                let Some((addr, bit, window_bits, len)) = state.preview_row(idx) else {
-                    return;
-                };
-                let key = crate::mem::entry_key(addr, bit);
-                let shown_bits = state.live_bits.get(&key).copied().unwrap_or(window_bits);
-                // 切換型別: 凍結解讀不同, 一律視為已變更
-                let changed = ty != state.frozen_ty || shown_bits != window_bits;
-                let struct_cache = float_view
-                    .then(|| {
-                        state.struct_cache.get(&addr).filter(|w| {
-                            w.ty == ty
-                                && w.anchor == state.struct_anchor
-                                && w.epoch == state.struct_epoch
+            .striped(true)
+            .resizable(true)
+            .vscroll(true)
+            .sense(egui::Sense::click())
+            .drag_to_scroll(egui::scroll_area::DragScroll::Always)
+            .column(Column::initial(addr_w).at_least(40.0).clip(true))
+            .column(Column::initial(raw_w).at_least(40.0).clip(true))
+            .column(Column::remainder().at_least(40.0).clip(true))
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.label("位址");
+                });
+                header.col(|ui| {
+                    ui.label("值");
+                });
+                header.col(|ui| {
+                    ui.label("解析值");
+                });
+            })
+            .body(|body| {
+                body.rows(row_h, row_count, |mut row| {
+                    let idx = row.index();
+                    let Some((addr, bit, window_bits, len)) = state.preview_row(idx) else {
+                        return;
+                    };
+                    let key = crate::mem::entry_key(addr, bit);
+                    let shown_bits = state.live_bits.get(&key).copied().unwrap_or(window_bits);
+                    // 切換型別: 凍結解讀不同, 一律視為已變更
+                    let changed = ty != state.frozen_ty || shown_bits != window_bits;
+                    let struct_cache = float_view
+                        .then(|| {
+                            state.struct_cache.get(&addr).filter(|w| {
+                                w.ty == ty
+                                    && w.anchor == state.struct_anchor
+                                    && w.epoch == state.struct_epoch
+                            })
                         })
-                    })
-                    .flatten();
-                let need_struct = float_view
-                    && match struct_cache {
-                        Some(w) => {
-                            state.refresh_interval > 0.0
-                                && w.at.elapsed().as_secs_f32() >= state.refresh_interval
-                        }
-                        None => true,
-                    };
-                if need_struct && state.struct_pending.get(&addr) != Some(&state.struct_epoch) {
-                    struct_requests.push(addr);
-                }
-                row.set_selected(state.selected.contains(&key));
-                row.col(|ui| {
-                    let text = if matches!(ty, ValueType::BoolBit) {
-                        format!("0x{:012x}({})", addr, bit)
-                    } else {
-                        format!("0x{:012x}", addr)
-                    };
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(text).monospace()).truncate(),
-                    );
-                });
-                row.col(|ui| {
-                    // Bit 的值就是該位的 0/1; 原始內容欄沿用該 bit 值
-                    let text = if matches!(ty, ValueType::BoolBit) {
-                        format!("{}", shown_bits as u8)
-                    } else if mem::is_string(ty) {
-                        format!("0x{:016x}", shown_bits)
-                    } else {
-                        hex_bytes(shown_bits, size)
-                    };
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(text).monospace()).truncate(),
-                    );
-                });
-                row.col(|ui| {
-                    if float_view {
-                        let prefixes = state.struct_view_kind.axis_prefixes();
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            for (axis, prefix) in prefixes.into_iter().enumerate() {
-                                let bits = if axis == state.struct_anchor {
-                                    Some(shown_bits)
-                                } else {
-                                    struct_cache.and_then(|w| w.values[axis])
-                                };
-                                let mut text = RichText::new(format!(
-                                    "{}={}",
-                                    prefix,
-                                    bits.map(|bits| format_float_bits(ty, bits))
-                                        .unwrap_or_else(|| "...".to_string())
-                                ))
-                                .monospace();
-                                if axis == state.struct_anchor {
-                                    text = text.color(if changed { CHANGED_COLOR } else { STRUCT_ANCHOR_COLOR });
-                                }
-                                ui.label(text);
+                        .flatten();
+                    let need_struct = float_view
+                        && match struct_cache {
+                            Some(w) => {
+                                state.refresh_interval > 0.0
+                                    && w.at.elapsed().as_secs_f32() >= state.refresh_interval
                             }
-                        });
-                    } else if mem::is_string(ty) {
-                        // 直接顯示記憶體中的字串 (只讀; 截斷以防過長)
-                        let display = if len > 0 {
-                            mem::hex_dump(state.pid, addr, len as usize)
-                        } else {
-                            Vec::new()
+                            None => true,
                         };
-                        let text = if display.is_empty() {
-                            format!("0x{shown_bits:016x}")
-                        } else if ty == ValueType::StringUtf8 {
-                            String::from_utf8_lossy(&display)
-                                .chars()
-                                .take(64)
-                                .collect()
+                    if need_struct && state.struct_pending.get(&addr) != Some(&state.struct_epoch) {
+                        struct_requests.push(addr);
+                    }
+                    row.set_selected(state.selected.contains(&key));
+                    row.col(|ui| {
+                        let text = if matches!(ty, ValueType::BoolBit) {
+                            format!("0x{:012x}({})", addr, bit)
                         } else {
-                            let units: Vec<u16> = display
-                                .chunks_exact(2)
-                                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                                .collect();
-                            String::from_utf16_lossy(&units)
-                                .chars()
-                                .take(64)
-                                .collect()
+                            format!("0x{:012x}", addr)
                         };
-                        let text = RichText::new(text);
-                        let text = if changed {
-                            text.color(CHANGED_COLOR)
+                        ui.add(egui::Label::new(egui::RichText::new(text).monospace()).truncate());
+                    });
+                    row.col(|ui| {
+                        // Bit 的值就是該位的 0/1; 原始內容欄沿用該 bit 值
+                        let text = if matches!(ty, ValueType::BoolBit) {
+                            format!("{}", shown_bits as u8)
+                        } else if mem::is_string(ty) {
+                            format!("0x{:016x}", shown_bits)
                         } else {
-                            text
+                            hex_bytes(shown_bits, size)
                         };
-                        ui.add(egui::Label::new(text).truncate());
-                    } else {
-                        let text = egui::RichText::new(ty.format(shown_bits));
-                        let text = if changed {
-                            text.color(CHANGED_COLOR)
+                        ui.add(egui::Label::new(egui::RichText::new(text).monospace()).truncate());
+                    });
+                    row.col(|ui| {
+                        if float_view {
+                            let prefixes = state.struct_view_kind.axis_prefixes();
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                for (axis, prefix) in prefixes.into_iter().enumerate() {
+                                    let bits = if axis == state.struct_anchor {
+                                        Some(shown_bits)
+                                    } else {
+                                        struct_cache.and_then(|w| w.values[axis])
+                                    };
+                                    let mut text = RichText::new(format!(
+                                        "{}={}",
+                                        prefix,
+                                        bits.map(|bits| format_float_bits(ty, bits))
+                                            .unwrap_or_else(|| "...".to_string())
+                                    ))
+                                    .monospace();
+                                    if axis == state.struct_anchor {
+                                        text = text.color(if changed {
+                                            CHANGED_COLOR
+                                        } else {
+                                            STRUCT_ANCHOR_COLOR
+                                        });
+                                    }
+                                    ui.label(text);
+                                }
+                            });
+                        } else if mem::is_string(ty) {
+                            // 直接顯示記憶體中的字串 (只讀; 截斷以防過長)
+                            let display = if len > 0 {
+                                mem::hex_dump(state.pid, addr, len as usize)
+                            } else {
+                                Vec::new()
+                            };
+                            let text = if display.is_empty() {
+                                format!("0x{shown_bits:016x}")
+                            } else if ty == ValueType::StringUtf8 {
+                                String::from_utf8_lossy(&display).chars().take(64).collect()
+                            } else {
+                                let units: Vec<u16> = display
+                                    .chunks_exact(2)
+                                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                                    .collect();
+                                String::from_utf16_lossy(&units).chars().take(64).collect()
+                            };
+                            let text = RichText::new(text);
+                            let text = if changed {
+                                text.color(CHANGED_COLOR)
+                            } else {
+                                text
+                            };
+                            ui.add(egui::Label::new(text).truncate());
                         } else {
-                            text
-                        };
-                        ui.add(egui::Label::new(text).truncate());
+                            let text = egui::RichText::new(ty.format(shown_bits));
+                            let text = if changed {
+                                text.color(CHANGED_COLOR)
+                            } else {
+                                text
+                            };
+                            ui.add(egui::Label::new(text).truncate());
+                        }
+                    });
+                    if row.response().clicked() {
+                        actions.push(UiAction::ToggleResultSelect(idx));
                     }
                 });
-                if row.response().clicked() {
-                    actions.push(UiAction::ToggleResultSelect(idx));
-                }
             });
-        });
     });
     if !struct_requests.is_empty() {
         actions.push(UiAction::PrefetchStructWindows(struct_requests));
@@ -3635,7 +3763,10 @@ fn draw_hex(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>) {
                 let chunk = &state.hex[start..(start + 16).min(state.hex.len())];
                 let addr = state.hex_addr + start as u64;
                 row.col(|ui| {
-                    ui.add(egui::Label::new(egui::RichText::new(format!("{addr:012x}")).monospace()).truncate());
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(format!("{addr:012x}")).monospace())
+                            .truncate(),
+                    );
                 });
                 row.col(|ui| {
                     let text = chunk
@@ -3672,7 +3803,11 @@ fn draw_lua(ui: &mut egui::Ui, state: &mut AppState) {
             state.lua_scripts = lua_env::load_all();
             state.bump();
         }
-        ui.label(RichText::new(dir.display().to_string()).monospace().size(12.0));
+        ui.label(
+            RichText::new(dir.display().to_string())
+                .monospace()
+                .size(12.0),
+        );
     });
     ui.add_space(6.0);
 
@@ -3680,26 +3815,38 @@ fn draw_lua(ui: &mut egui::Ui, state: &mut AppState) {
         ui.label("Lua/ 目錄為空或不存在");
         return;
     }
-    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        for idx in 0..state.lua_scripts.len() {
-            let name = state.lua_scripts[idx].file_name.clone();
-            CollapsingHeader::new(&name)
-                .default_open(true)
-                .show(ui, |ui| draw_lua_script(ui, state, idx));
-            ui.add_space(4.0);
-        }
-    });
+    ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for idx in 0..state.lua_scripts.len() {
+                let name = state.lua_scripts[idx].file_name.clone();
+                CollapsingHeader::new(&name)
+                    .default_open(true)
+                    .show(ui, |ui| draw_lua_script(ui, state, idx));
+                ui.add_space(4.0);
+            }
+        });
 }
 
 fn draw_lua_script(ui: &mut egui::Ui, state: &mut AppState, idx: usize) {
     let script = &mut state.lua_scripts[idx];
     if let Some(err) = &script.error {
-        ui.label(RichText::new(err).monospace().size(12.0).color(Color32::LIGHT_RED));
+        ui.label(
+            RichText::new(err)
+                .monospace()
+                .size(12.0)
+                .color(Color32::LIGHT_RED),
+        );
         ui.add_space(4.0);
     }
 
     // Tick 是每幀回呼, 不是可點擊的動作; 每幀重建列表故 clone 順手過濾
-    let functions: Vec<String> = script.functions.iter().filter(|f| *f != "Tick").cloned().collect();
+    let functions: Vec<String> = script
+        .functions
+        .iter()
+        .filter(|f| *f != "Tick")
+        .cloned()
+        .collect();
     let variables = script.variables.clone();
     if functions.is_empty() && variables.is_empty() {
         ui.label(RichText::new("(無反射項目)").color(Color32::GRAY));
@@ -3762,11 +3909,7 @@ fn draw_lua_variables_flow(
 /// 無緩存(如剛進頁面)時獨佔一行並量測, 配合 request_discard 令本幀重排為緩存尺寸。
 /// add 在量測幀與正式幀各執行一次; 量測幀無事件輸入, 其中的 changed() 必為 false,
 /// 故 set_global 等寫回只會在正式幀觸發。回傳 true 表示內容有變
-fn framed_var(
-    ui: &mut egui::Ui,
-    id: egui::Id,
-    add: impl FnOnce(&mut egui::Ui) -> bool,
-) {
+fn framed_var(ui: &mut egui::Ui, id: egui::Id, add: impl FnOnce(&mut egui::Ui) -> bool) {
     if let Some(size) = ui.data_mut(|data| data.get_temp::<Vec2>(id)) {
         let changed = ui
             .allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| add(ui))
@@ -3782,7 +3925,10 @@ fn framed_var(
     let start = ui.available_rect_before_wrap().min;
     let mut child = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(egui::Rect::from_min_size(start, Vec2::new(1_000_000.0, 10_000.0)))
+            .max_rect(egui::Rect::from_min_size(
+                start,
+                Vec2::new(1_000_000.0, 10_000.0),
+            ))
             .sizing_pass(),
     );
     let _ = add(&mut child);
@@ -3798,17 +3944,25 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
         *on = !*on;
         response.mark_changed();
     }
-    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *on, ""));
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *on, ""));
 
     if ui.is_rect_visible(rect) {
         let how_on = ui.ctx().animate_bool_responsive(response.id, *on);
         let visuals = ui.style().interact_selectable(&response, *on);
         let rect = rect.expand(visuals.expansion);
         let radius = 0.5 * rect.height();
-        ui.painter().rect(rect, radius, visuals.bg_fill, visuals.bg_stroke, egui::StrokeKind::Inside);
+        ui.painter().rect(
+            rect,
+            radius,
+            visuals.bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
         let circle_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
         let center = egui::pos2(circle_x, rect.center().y);
-        ui.painter().circle(center, 0.75 * radius, visuals.bg_fill, visuals.fg_stroke);
+        ui.painter()
+            .circle(center, 0.75 * radius, visuals.bg_fill, visuals.fg_stroke);
     }
 
     response
@@ -3834,7 +3988,11 @@ fn vector_group(script: &lua_env::LuaScript, vars: &[String], i: usize) -> Optio
     use mlua::Value;
     fn is_scalar(script: &lua_env::LuaScript, name: &str) -> bool {
         matches!(
-            script.lua.globals().get::<Value>(name).unwrap_or(Value::Nil),
+            script
+                .lua
+                .globals()
+                .get::<Value>(name)
+                .unwrap_or(Value::Nil),
             Value::Integer(_) | Value::Number(_)
         )
     }
@@ -3843,11 +4001,16 @@ fn vector_group(script: &lua_env::LuaScript, vars: &[String], i: usize) -> Optio
     if prefix.is_empty() {
         return None;
     }
-    let y = vars.get(i + 1).filter(|b| b.as_str() == format!("{prefix}Y"))?;
+    let y = vars
+        .get(i + 1)
+        .filter(|b| b.as_str() == format!("{prefix}Y"))?;
     if !is_scalar(script, a) || !is_scalar(script, y) {
         return None;
     }
-    if let Some(z) = vars.get(i + 2).filter(|b| b.as_str() == format!("{prefix}Z")) {
+    if let Some(z) = vars
+        .get(i + 2)
+        .filter(|b| b.as_str() == format!("{prefix}Z"))
+    {
         if is_scalar(script, z) {
             return Some(VectorGroup::Vec3(
                 prefix.to_string(),
@@ -3861,10 +4024,20 @@ fn vector_group(script: &lua_env::LuaScript, vars: &[String], i: usize) -> Optio
 }
 
 /// Vector 元素: 軸標籤 + DragValue, 回傳是否改變
-fn vector_scalar(ui: &mut egui::Ui, script: &mut lua_env::LuaScript, name: &str, axis: &str) -> bool {
+fn vector_scalar(
+    ui: &mut egui::Ui,
+    script: &mut lua_env::LuaScript,
+    name: &str,
+    axis: &str,
+) -> bool {
     use mlua::Value;
     ui.label(RichText::new(format!("{axis}:")).monospace());
-    match script.lua.globals().get::<Value>(name).unwrap_or(Value::Nil) {
+    match script
+        .lua
+        .globals()
+        .get::<Value>(name)
+        .unwrap_or(Value::Nil)
+    {
         Value::Integer(mut n) => {
             let response = ui.add(egui::DragValue::new(&mut n).speed(1));
             if response.changed() {
@@ -3884,7 +4057,14 @@ fn vector_scalar(ui: &mut egui::Ui, script: &mut lua_env::LuaScript, name: &str,
 }
 
 /// Vector2 複合型別控件: 兩個純量 X/Y 同一 chip 内編輯; 仍是兩個獨立全局變數
-fn draw_lua_vector2(ui: &mut egui::Ui, idx: usize, prefix: &str, x_name: &str, y_name: &str, state: &mut AppState) {
+fn draw_lua_vector2(
+    ui: &mut egui::Ui,
+    idx: usize,
+    prefix: &str,
+    x_name: &str,
+    y_name: &str,
+    state: &mut AppState,
+) {
     let script = &mut state.lua_scripts[idx];
     let id = ui.make_persistent_id(("framed_var", script.file_name.as_str(), prefix, "v2"));
     framed_var(ui, id, |ui| {
@@ -3898,7 +4078,15 @@ fn draw_lua_vector2(ui: &mut egui::Ui, idx: usize, prefix: &str, x_name: &str, y
 }
 
 /// Vector3 複合型別控件: 三個純量 X/Y/Z 同一 chip 内編輯; 仍是三個獨立全局變數
-fn draw_lua_vector3(ui: &mut egui::Ui, idx: usize, prefix: &str, x_name: &str, y_name: &str, z_name: &str, state: &mut AppState) {
+fn draw_lua_vector3(
+    ui: &mut egui::Ui,
+    idx: usize,
+    prefix: &str,
+    x_name: &str,
+    y_name: &str,
+    z_name: &str,
+    state: &mut AppState,
+) {
     let script = &mut state.lua_scripts[idx];
     let id = ui.make_persistent_id(("framed_var", script.file_name.as_str(), prefix, "v3"));
     framed_var(ui, id, |ui| {
@@ -3915,7 +4103,11 @@ fn draw_lua_vector3(ui: &mut egui::Ui, idx: usize, prefix: &str, x_name: &str, y
 fn draw_lua_variable(ui: &mut egui::Ui, idx: usize, name: &str, state: &mut AppState) {
     use mlua::Value;
     let script = &mut state.lua_scripts[idx];
-    let value = script.lua.globals().get::<Value>(name).unwrap_or(Value::Nil);
+    let value = script
+        .lua
+        .globals()
+        .get::<Value>(name)
+        .unwrap_or(Value::Nil);
     match value {
         Value::Integer(mut x) => {
             let label = format!("{name}:");
@@ -3937,7 +4129,8 @@ fn draw_lua_variable(ui: &mut egui::Ui, idx: usize, name: &str, state: &mut AppS
             framed_var(ui, id, |ui| {
                 var_chip(ui, |ui| {
                     ui.label(RichText::new(&label).monospace());
-                    let response = ui.add(egui::DragValue::new(&mut v).speed(0.001).max_decimals(4));
+                    let response =
+                        ui.add(egui::DragValue::new(&mut v).speed(0.001).max_decimals(4));
                     if response.changed() {
                         lua_env::set_global(script, name, Value::Number(v));
                     }
@@ -3959,50 +4152,48 @@ fn draw_lua_variable(ui: &mut egui::Ui, idx: usize, name: &str, state: &mut AppS
                 })
             });
         }
-        other => {
-            match other {
-                    Value::String(s) => {
-                        let mut v = s.to_string_lossy();
-                        let label = format!("{name}:");
-                        let id = ui.make_persistent_id(("framed_var", script.file_name.as_str(), name));
-                        framed_var(ui, id, |ui| {
-                            var_chip(ui, |ui| {
-                                ui.label(RichText::new(&label).monospace());
-                                let font_id = egui::TextStyle::Body.resolve(ui.style());
-                                let text_w = ui
-                                    .painter()
-                                    .layout_no_wrap(v.clone(), font_id, ui.visuals().text_color())
-                                    .size()
-                                    .x;
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(&mut v)
-                                        .desired_width((text_w + 16.0).max(60.0)),
-                                );
-                                if response.changed() {
-                                    match script.lua.create_string(&v) {
-                                        Ok(ls) => lua_env::set_global(script, name, Value::String(ls)),
-                                        Err(e) => script.error = Some(format!("{name}: {e}")),
-                                    }
-                                }
-                                response.changed()
-                            })
-                        });
-                    }
-                    kind => {
-                        let label = match kind {
-                            Value::Nil => "nil",
-                            Value::Table(_) => "table",
-                            Value::Function(_) => "function",
-                            Value::Thread(_) => "thread",
-                            Value::UserData(_) => "userdata",
-                            Value::LightUserData(_) => "lightuserdata",
-                            Value::Error(_) => "error",
-                            _ => "other",
-                        };
-                        ui.label(RichText::new(format!("{name} = <{label}>")).monospace());
-                    }
+        other => match other {
+            Value::String(s) => {
+                let mut v = s.to_string_lossy();
+                let label = format!("{name}:");
+                let id = ui.make_persistent_id(("framed_var", script.file_name.as_str(), name));
+                framed_var(ui, id, |ui| {
+                    var_chip(ui, |ui| {
+                        ui.label(RichText::new(&label).monospace());
+                        let font_id = egui::TextStyle::Body.resolve(ui.style());
+                        let text_w = ui
+                            .painter()
+                            .layout_no_wrap(v.clone(), font_id, ui.visuals().text_color())
+                            .size()
+                            .x;
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut v)
+                                .desired_width((text_w + 16.0).max(60.0)),
+                        );
+                        if response.changed() {
+                            match script.lua.create_string(&v) {
+                                Ok(ls) => lua_env::set_global(script, name, Value::String(ls)),
+                                Err(e) => script.error = Some(format!("{name}: {e}")),
+                            }
+                        }
+                        response.changed()
+                    })
+                });
             }
-        }
+            kind => {
+                let label = match kind {
+                    Value::Nil => "nil",
+                    Value::Table(_) => "table",
+                    Value::Function(_) => "function",
+                    Value::Thread(_) => "thread",
+                    Value::UserData(_) => "userdata",
+                    Value::LightUserData(_) => "lightuserdata",
+                    Value::Error(_) => "error",
+                    _ => "other",
+                };
+                ui.label(RichText::new(format!("{name} = <{label}>")).monospace());
+            }
+        },
     }
 }
 
@@ -4144,8 +4335,11 @@ fn draw_shortcut_layout(ui: &mut egui::Ui, state: &mut AppState, _actions: &mut 
         let f = flags.borrow();
         if f.exit_rename {
             let trimmed = name_buf.borrow().trim().to_string();
-            state.shortcut_groups[group_idx].name =
-                if trimmed.is_empty() { "未命名".to_string() } else { trimmed };
+            state.shortcut_groups[group_idx].name = if trimmed.is_empty() {
+                "未命名".to_string()
+            } else {
+                trimmed
+            };
             state.shortcut_renaming = None;
             state.bump();
         }
@@ -4257,7 +4451,12 @@ fn bar_ui(
                             row: row_loc.row,
                             chip: chip_idx,
                         };
-                        let chip_id = egui::Id::unique(("shortcut_layout_chip", row_loc.group, row_loc.row, chip_idx));
+                        let chip_id = egui::Id::unique((
+                            "shortcut_layout_chip",
+                            row_loc.group,
+                            row_loc.row,
+                            chip_idx,
+                        ));
                         let chip_response = ui
                             .dnd_drag_source(chip_id, DragPayload::Chip(chip_loc), |ui| {
                                 ui.label(chip);
@@ -4271,10 +4470,9 @@ fn bar_ui(
                             chip_idx + 1
                         };
                         // Preview insertion:
-                        if let (Some(pointer), Some(hovered_payload)) = (
-                            pointer,
-                            chip_response.dnd_hover_payload::<DragPayload>(),
-                        ) {
+                        if let (Some(pointer), Some(hovered_payload)) =
+                            (pointer, chip_response.dnd_hover_payload::<DragPayload>())
+                        {
                             if let DragPayload::Chip(hovered_loc) = *hovered_payload {
                                 let stroke = insertion_stroke(ui, 1.0);
                                 if hovered_loc == chip_loc {
@@ -4363,7 +4561,11 @@ fn bar_ui(
             }
             DragPayload::Row(from_loc) => {
                 if allow_row_dnd {
-                    let rect = if from_bar { bar_rect.unwrap_or(whole_rect) } else { whole_rect };
+                    let rect = if from_bar {
+                        bar_rect.unwrap_or(whole_rect)
+                    } else {
+                        whole_rect
+                    };
                     let y = ui
                         .input(|i| i.pointer.interact_pos())
                         .map_or(rect.center().y, |p| p.y);
@@ -4531,7 +4733,10 @@ fn draw_bottom_bar(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiActi
                 ui.separator();
             }
             if Some(i) == copy_idx {
-                if ui.add(egui::Label::new(item).sense(egui::Sense::click())).clicked() {
+                if ui
+                    .add(egui::Label::new(item).sense(egui::Sense::click()))
+                    .clicked()
+                {
                     actions.push(UiAction::CopyText(format!("0x{:x}", state.module_base)));
                 }
             } else {

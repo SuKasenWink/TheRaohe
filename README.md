@@ -37,16 +37,18 @@ cargo xtask deploy --restart  # 先 pkill 再部署 (推薦)
 - 裝置已取得 root (KernelSU / Magisk)
 - 安裝 MT Manager (或任一支援 root 的檔案管理器)
 - 瀏覽器下載 `theraohe.tar.gz` (預設落在 `/sdcard/Download/`)
+- 刷入 RT-hook_loctl
 
+步驟:
 1. MT Manager 開啟 `/sdcard/Download/theraohe.tar.gz`, 解壓到 `/data/local/tmp/`
 2. 以 root 身份執行 `/data/local/tmp/theraohe/Start.sh`
 3. 螢幕上出現疊加界面即成功
 
 不想用 MT Manager 的話, 也可以用 Termux:
-    ```bash
-    su
-    tar -xzf /sdcard/Download/theraohe.tar.gz -C /data/local/tmp
-    /data/local/tmp/theraohe/theraohe --show
-    ```
+```bash
+su
+tar -xzf /sdcard/Download/theraohe.tar.gz -C /data/local/tmp
+/data/local/tmp/theraohe/theraohe --show
+```
 
 已於 Google Pixel OS 17 (CP3A.261005.055)(KernelSU LKM) 測試。
