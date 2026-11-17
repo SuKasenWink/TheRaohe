@@ -575,6 +575,12 @@ fn load_one(path: &std::path::Path) -> LuaScript {
                 .map_err(|e| e.to_string())
         })
         .err();
+    if let Some(e) = error.as_deref() {
+        eprintln!("[lua] {file_name} 載入失敗: {e}");
+    }
+    if let Some(e) = api_error.as_deref() {
+        eprintln!("[lua] {file_name} {e}");
+    }
     // 腳本自身的默認值在 exec 之後、apply_config 之前拍快照:
     // 它既包含腳本自建變量的字面默認, 也包含完整的 stdlib; 與 baseline 的作用不同
     let defaults = snapshot_globals(&lua);
@@ -603,14 +609,11 @@ fn snapshot_globals(lua: &Lua) -> Vec<(String, Value)> {
         .collect()
 }
 
-// xy 函式判定: 兩參數且形參名必為 x,y (debug.getlocal 讀形參表; C 函式/變參不計入)
+// xy 函式判定 (Luau): Luau 沒有參數名 introspection (debug.getlocal 不存在), 只能按參數數量 — 兩參數即接落點候選
 fn is_xy_signature(lua: &Lua, f: &Function) -> bool {
     const CHUNK: &str = r#"
         local f = ...
-        local n1 = debug.getlocal(f, 1)
-        local n2 = debug.getlocal(f, 2)
-        if n1 ~= "x" or n2 ~= "y" then return false end
-        return debug.getlocal(f, 3) == nil
+        return debug.info(f, "a") == 2
     "#;
     lua.load(CHUNK).call::<bool>((f,)).unwrap_or(false)
 }

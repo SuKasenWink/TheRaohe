@@ -188,9 +188,18 @@ fn build(api: u32, ndk: Option<&Path>, release: bool) -> Result<PathBuf> {
         bail!("找不到 clang: {}", clang.display());
     }
 
+    let clang_rt = ndk
+        .join("toolchains").join("llvm").join("prebuilt").join(host)
+        .join("lib").join("clang").join("18").join("lib").join("linux").join("libclang_rt.builtins-aarch64-android.a");
+    if !clang_rt.is_file() {
+        bail!("找不到 libclang_rt.builtins: {}", clang_rt.display());
+    }
+
     let rustflags = format!(
-        "-Clink-arg=--target=aarch64-linux-android{api} -Clink-arg=-fuse-ld=lld -Clink-arg=-Wl,-z,max-page-size=16384"
+        "-Clink-arg=--target=aarch64-linux-android{api} -Clink-arg=-fuse-ld=lld -Clink-arg=-Wl,-z,max-page-size=16384 -Clink-arg=-Wl,-rpath,/data/local/tmp/theraohe -Clink-arg={}",
+        clang_rt.display()
     );
+    let sysroot = ndk.join("toolchains").join("llvm").join("prebuilt").join(host).join("sysroot");
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
         .arg("--target")
@@ -198,6 +207,11 @@ fn build(api: u32, ndk: Option<&Path>, release: bool) -> Result<PathBuf> {
         .env("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", &clang)
         .env("CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS", rustflags)
         .env("CC_aarch64_linux_android", &clang)
+        .env("CXX_aarch64_linux_android", bin_dir.join(exe_name("clang++")))
+        .env(
+            "CXXFLAGS_aarch64_linux_android",
+            format!("-stdlib=libc++ --sysroot={}", sysroot.display()),
+        )
         .env("AR_aarch64_linux_android", bin_dir.join(exe_name("llvm-ar")))
         .current_dir(&root);
     if release {

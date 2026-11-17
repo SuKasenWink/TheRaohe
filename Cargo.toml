@@ -29,7 +29,7 @@ tokio = { version = "1.54.1", default-features = false, features = ["rt", "net",
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 serde = { version = "1.0.229", features = ["derive"] }
 schemars = "1.2.3"
-mlua = { version = "0.12", default-features = false, features = ["lua54", "vendored", "send"] }
+mlua = { version = "0.12", default-features = false, features = ["luau-jit", "send"] }
 toon-format = { version = "0.7.0", default-features = false }
 
 [profile.release]
