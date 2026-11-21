@@ -480,6 +480,13 @@ fn deploy(
     }
 
     let extract = format!("tar -xzf {remote_tgz} -C {dir}");
+    // 腳本由 tarball 完整重寫, 避免改名/刪檔留下過期腳本載入兩次;
+    // *.toon 保留 — 那是腳本持久化的配置, 不能每次 deploy 就歸零
+    let lua_dir = format!("{dir}/Lua");
+    for spec in ["*.lua", "*.luau"] {
+        let cmd = format!("rm -f {lua_dir}/{spec}");
+        let _ = adb_run(&adb, serial, &["shell", "su", "-c", &cmd]);
+    }
     let status = adb_run(&adb, serial, &["shell", "su", "-c", &extract])?;
     if !status.success() {
         // 回退路徑: 疑似舊實例佔用二進位才 pkill 重試; 其它原因 (磁碟滿等) 不動裝置上的行程

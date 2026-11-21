@@ -104,9 +104,11 @@ fn composite(
             if a == 0 {
                 continue;
             }
+            // canvas 是 premultiplied RGBA (CPU 軟渲 / GPU capture 同法),
+            // 直接加 bg*inv 就是正確的 over 合成, 不要再乘一次 a
             let inv = 255 - a;
             for i in 0..3 {
-                spx[i] = ((opx[i] as u32 * a + spx[i] as u32 * inv) / 255) as u8;
+                spx[i] = ((opx[i] as u32 + (spx[i] as u32 * inv + 127) / 255).min(255)) as u8;
             }
             spx[3] = 255;
         }

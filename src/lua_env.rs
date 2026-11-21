@@ -23,12 +23,16 @@ pub struct LuaScript {
     baseline: Vec<(String, Value)>,
     /// 腳本自身的默認值: exec 之後、apply_config 覆蓋 toon 之前的全域快照;
     /// 「僅變化才記錄」以它為基準 — 腳本自建的變量自帶的值不算差異, 只有使用者真正改過的才入檔
-    defaults: Vec<(String, Value)>,
+    pub(crate) defaults: Vec<(String, Value)>,
     pub file_name: String,
     pub lua: Lua,
     pub functions: Vec<String>,
     pub variables: Vec<String>,
     pub error: Option<String>,
+    /// 啟用/禁用: 禁用時 Tick/ Begin/ 按鈕/ 捷徑一律靜默, 僅持久記錄在同名 .toon (缺省啓用)
+    pub enabled: bool,
+    /// Begin 本輪進程是否已執行過 (僅運行態, 不入檔)
+    begin_done: bool,
 }
 
 /// Lua 回呼在 AppState 鎖內(按鈕/ draw_lua)或鎖外(Begin)都可能觸發,
@@ -139,7 +143,7 @@ fn read_into(pid: i32, addr: u64, buf: &mut [u8]) -> bool {
     pid > 0 && crate::nb9::read(pid, addr, buf)
 }
 
-fn register_api(lua: &Lua) -> mlua::Result<()> {
+fn register_api(lua: &Lua, caller_stem: &str) -> mlua::Result<()> {
     let t = lua.create_table()?;
     let select = lua.create_function(|_, arg: Value| -> mlua::Result<()> {
         match arg {
@@ -395,6 +399,16 @@ fn register_api(lua: &Lua) -> mlua::Result<()> {
     t.set("touch_move", mk_touch(crate::nb9::TOUCH_MOVE)?)?;
     t.set("touch_up", mk_touch(crate::nb9::TOUCH_UP)?)?;
 
+    // keyed tabular 物件查詢: table = toon 的根 key (例如 "supplies");
+    // key 歸一化字串比對; field = 欄位名; 類型不匹配/缺行/缺欄一律 nil, 不接觸 FS
+    let caller = caller_stem.to_string();
+    let keyed_tabular_objects = lua.create_function(
+        move |lua, (table, key, field): (String, Value, String)| -> mlua::Result<Value> {
+            Ok(crate::toon_tables::lookup_lua(lua, &caller, &table, &key, &field))
+        },
+    )?;
+    t.set("keyed_tabular_objects", keyed_tabular_objects)?;
+
     lua.globals().set("theraohe", t)?;
     Ok(())
 }
@@ -403,6 +417,9 @@ fn register_api(lua: &Lua) -> mlua::Result<()> {
 /// 與腳本自身默認不同的值; 由 lua_env 內部讀寫, 不給 Lua 開放檔案能力
 #[derive(Serialize, Deserialize)]
 struct PersistedLuaConfig {
+    /// None = 啓用 (預設); Some(false) = 使用者手動禁用 — 僅記錄禁用這一態, 不寫 enabled: true
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     variables: Vec<PersistedLuaVar>,
 }
 
@@ -422,7 +439,7 @@ enum LuaScalar {
 }
 
 fn config_path(dir: &std::path::Path, file_name: &str) -> PathBuf {
-    let stem = file_name.strip_suffix(".lua").unwrap_or(file_name);
+    let stem = stem_of(file_name);
     dir.join(format!("{stem}.toon"))
 }
 
@@ -442,6 +459,7 @@ fn apply_config(script: &mut LuaScript) {
     }
     match toon_format::decode_default::<PersistedLuaConfig>(&text) {
         Ok(cfg) => {
+            script.enabled = cfg.enabled.unwrap_or(true);
             for var in cfg.variables {
                 // Integer/Number globals 對 Int/Float scalar 兩向相容 (腳本型別決定不了值型別);
                 // Boolean/String 嚴格對型
@@ -504,13 +522,16 @@ pub(crate) fn save_configs(scripts: &[LuaScript]) {
             }
             vars.push(PersistedLuaVar { name, value: scalar });
         }
-        // 沒有自定義 → 不留文件
-        if vars.is_empty() {
+        // 沒有自定義 且 啓用態 → 不留文件; 禁用態必須保留 (否則重啓後啟用 flag 丟失)
+        if vars.is_empty() && script.enabled {
             let _ = std::fs::remove_file(&path);
             continue;
         }
         vars.sort_by(|a, b| a.name.cmp(&b.name));
-        let cfg = PersistedLuaConfig { variables: vars };
+        let cfg = PersistedLuaConfig {
+            enabled: (!script.enabled).then_some(false),
+            variables: vars,
+        };
         match toon_format::encode_default(&cfg) {
             Ok(text) => {
                 let tmp = path.with_extension("toon.tmp");
@@ -530,6 +551,8 @@ pub fn dir() -> Option<PathBuf> {
 }
 
 pub fn load_all() -> Vec<LuaScript> {
+    // 重掃並整體交換 Toon 資料表 (重新載入按鈕一併觸發)
+    crate::toon_tables::refresh();
     let Some(dir) = dir() else {
         return Vec::new();
     };
@@ -540,7 +563,10 @@ pub fn load_all() -> Vec<LuaScript> {
             .filter(|p| {
                 p.is_file()
                     && p.extension()
-                        .map(|e| e.eq_ignore_ascii_case("lua"))
+                        .map(|e| {
+                            let s = e.to_string_lossy().to_ascii_lowercase();
+                            s == "lua" || s == "luau"
+                        })
                         .unwrap_or(false)
             })
             .collect(),
@@ -563,7 +589,10 @@ fn load_one(path: &std::path::Path) -> LuaScript {
             mlua::LuaOptions::default(),
         )
     };
-    let api_error = register_api(&lua).err().map(|e| format!("內建 API 註冊失敗: {e}"));
+    let caller_stem = stem_of(&file_name).to_string();
+    let api_error = register_api(&lua, &caller_stem)
+        .err()
+        .map(|e| format!("內建 API 註冊失敗: {e}"));
     let baseline = snapshot_globals(&lua);
     // lua.load 不經過 luaL_loadfilex, 需自行剝 UTF-8 BOM, 否則記事本等編輯器存的檔直接語法錯誤
     let error = std::fs::read_to_string(path)
@@ -592,6 +621,8 @@ fn load_one(path: &std::path::Path) -> LuaScript {
         functions: Vec::new(),
         variables: Vec::new(),
         error: error.or(api_error),
+        enabled: true,
+        begin_done: false,
     };
     apply_config(&mut script);
     refresh_reflection(&mut script);
@@ -647,7 +678,26 @@ fn refresh_reflection(script: &mut LuaScript) {
 
 /// 按鈕呼叫: 依 num_params 決定傳參 (0 → 無參; 2 → 若給了 (x, y) 帶 xy, 否則無參);
 /// 成功回函式 reply; 失敗回 None 且 script.error 設值 (Lua 頁可見)
+/// 移除腳本副檔名 (.lua / .luau) — 供 .toon 配置名推算
+pub fn stem_of(file_name: &str) -> &str {
+    for ext in [".lua", ".luau"] {
+        if let Some(s) = file_name.strip_suffix(ext) {
+            return s;
+        }
+    }
+    file_name
+}
+
+/// 腳本名是否符合 `<stem>` (相容 .lua / .luau 兩種)
+pub fn script_name_matches_stem(file_name: &str, stem: &str) -> bool {
+    file_name == format!("{stem}.lua") || file_name == format!("{stem}.luau")
+}
+
 pub fn call(script: &mut LuaScript, name: &str, args: Option<(f64, f64)>) -> Option<Value> {
+    // 禁用態: Tick/ 按鈕/ 捷徑/ xy 函式一律靜默 (Begin 不走同一條 gate, 見 begin_if_enabled)
+    if !script.enabled {
+        return None;
+    }
     let result = (|| -> mlua::Result<Value> {
         let func: Function = script.lua.globals().get(name)?;
         match func.info().num_params {
@@ -695,6 +745,21 @@ pub fn call_tick(script: &mut LuaScript) {
 /// 非零參/不存在則靜默跳過, 錯誤寫入 script.error 供 UI 顯示
 pub fn call_begin(script: &mut LuaScript) {
     call_zero_arg(script, "Begin");
+}
+
+/// 啓動及運行態啓用時補呼叫: 僅在「啓用 && 本進程尚未執行過」時真 Begin —
+/// 啓用已執行過的腳本切回啓用不會重覆副作用
+pub fn begin_if_enabled(script: &mut LuaScript) {
+    if script.enabled && !script.begin_done {
+        call_begin(script);
+        script.begin_done = true;
+    }
+}
+
+/// 啓用/禁用一鍵切換: 禁用只影響後續呼叫; 啓用時按需補 Begin (覆蓋「啓動即禁用→運行態啓用」路徑)
+pub fn set_script_enabled(script: &mut LuaScript, enabled: bool) {
+    script.enabled = enabled;
+    begin_if_enabled(script);
 }
 
 fn call_zero_arg(script: &mut LuaScript, name: &str) -> bool {

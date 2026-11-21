@@ -72,6 +72,8 @@ pub struct ShortcutGroup {
     pub allow_out_of_bounds: bool,
     /// 懸浮窗的最後可見 rect(使用者拖動的位置/大小); 未曾拖動/沒畫出來時為 None
     pub window_geom: Option<egui::Rect>,
+    /// 上次關閉時是否摺疊; 與窗口幾何分開存, 避免把摺疊高度誤記成展開尺寸
+    pub collapsed: bool,
 }
 
 /// 渲染後端: GPU (wgpu) 或 CPU (egui 軟體後端); 默認 GPU。
@@ -145,7 +147,7 @@ impl Tab {
             Tab::Maps => "映射",
             Tab::Scan => "掃描",
             Tab::Hex => "Hex Dump",
-            Tab::Lua => "Lua",
+            Tab::Lua => "Luau",
             Tab::Settings => "設置",
         }
     }
@@ -162,6 +164,7 @@ impl ShortcutGroup {
             free_position: true,
             allow_out_of_bounds: false,
             window_geom: None,
+            collapsed: false,
         }
     }
 }
@@ -495,6 +498,7 @@ pub struct AppState {
     pub type_open: bool,
     pub cond_open: bool,
     pub refresh_interval: f32,
+    pub dumping: bool,
     /// hex 頁專用的重新整理間隙, 與掃描結果的 refresh_interval 各自獨立
     pub hex_refresh_interval: f32,
     /// 介面縮放的單一真相來源; 設置頁 DragValue 寫它, ctx 側用 set_zoom_factor 跟上
@@ -568,7 +572,7 @@ impl AppState {
             live_bits: HashMap::new(),
             struct_view_kind: StructViewKind::None,
             struct_anchor: 0,
-            struct_open: true,
+            struct_open: false,
             struct_cache: HashMap::new(),
             struct_pending: HashMap::new(),
             struct_epoch: 1,
@@ -577,6 +581,7 @@ impl AppState {
             range_min: String::new(),
             range_max: String::new(),
             scanning: false,
+            dumping: false,
             hex_addr: 0,
             hex: Vec::new(),
             events: Vec::new(),
@@ -606,11 +611,12 @@ impl AppState {
             collapse_toggle: std::sync::atomic::AtomicBool::new(false),
             status_bar_h,
         };
-        // 此時 egui 宿主已建立、行程表已掃描完: 自動呼叫各腳本 Begin(), 再排空 Lua 發出的命令
+        // 此時 egui 宿主已建立、行程表已掃描完: 自動呼叫啓用狀態下的各腳本 Begin(), 再排空 Lua 發出的命令;
+        // 禁用態跳過 Begin (運行態啓用時由 begin_if_enabled 補)
         lua_env::set_target_info(0, 0);
         lua_env::set_module_index(&state.maps);
         for script in &mut state.lua_scripts {
-            lua_env::call_begin(script);
+            lua_env::begin_if_enabled(script);
         }
         apply_lua_cmds(&mut state);
         state
@@ -949,6 +955,7 @@ pub(crate) enum UiAction {
     ToggleCondOpen,
 
     StartScan,
+    DumpMemory,
     StartRefine,
     ToggleResultSelect(usize),
     SetExpandOff(u8),
@@ -989,11 +996,7 @@ fn shortcut_trigger(label: &str) -> Option<UiAction> {
 fn sync_shortcut_candidates(state: &mut AppState) {
     let mut cand: Vec<String> = SHORTCUT_BUILTIN.iter().map(|s| s.to_string()).collect();
     for script in &state.lua_scripts {
-        let stem = script
-            .file_name
-            .strip_suffix(".lua")
-            .unwrap_or(&script.file_name)
-            .to_string();
+        let stem = crate::lua_env::stem_of(&script.file_name).to_string();
         for f in &script.functions {
             if f == "Tick" {
                 continue;
@@ -1151,6 +1154,45 @@ pub(crate) fn apply_lua_cmds(state: &mut AppState) {
     }
 }
 
+fn start_dump_memory(app: &Arc<Mutex<AppState>>) {
+    let job = {
+        let mut state = match app.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if state.dumping {
+            return;
+        }
+        if state.pid <= 0 {
+            state.status = "尚未附加行程".to_string();
+            state.bump();
+            return;
+        }
+        state.dumping = true;
+        state.status = "傾印記憶體…".to_string();
+        state.bump();
+        (state.pid, state.maps.clone())
+    };
+    let app = Arc::clone(app);
+    std::thread::spawn(move || {
+        let report = crate::dump::dump_rw_memory(job.0, &job.1, "/data/local/tmp/theraohe");
+        if let Ok(mut state) = app.lock() {
+            state.dumping = false;
+            state.status = match report {
+                Ok(r) => format!(
+                    "傾印完成 {} 個區段 {:.1} GB → {} (補零 {} MB)",
+                    r.regions,
+                    r.bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    r.dir.display(),
+                    r.zero_bytes >> 20
+                ),
+                Err(e) => format!("傾印失敗: {e}"),
+            };
+            state.bump();
+        }
+    });
+}
+
 pub(crate) fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
     match action {
         UiAction::StartScan => {
@@ -1163,6 +1205,10 @@ pub(crate) fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
             } else {
                 start_scan(app);
             }
+            return;
+        }
+        UiAction::DumpMemory => {
+            start_dump_memory(app);
             return;
         }
         UiAction::StartRefine => {
@@ -1297,7 +1343,7 @@ pub(crate) fn apply_action(app: &Arc<Mutex<AppState>>, action: UiAction) {
             crate::lua_env::save_configs(&state.lua_scripts);
             std::process::exit(0);
         }
-        UiAction::StartScan | UiAction::StartRefine | UiAction::PrefetchStructWindows(_) => {}
+        UiAction::StartScan | UiAction::StartRefine | UiAction::PrefetchStructWindows(_) | UiAction::DumpMemory => {}
     }
 }
 
@@ -1944,19 +1990,40 @@ pub struct UiHost {
 
 impl UiHost {
     pub fn load(font_path: &str, font_index: Option<u32>, zoom: f32) -> Result<Self, String> {
-        let data = std::fs::read(font_path).map_err(|e| format!("read {font_path}: {e}"))?;
-        let mut fonts = FontDefinitions::default();
+        const CJK_PATH: &str = "/system/fonts/NotoSansCJK-Regular.ttc";
         let index = font_index.unwrap_or(0);
-        let noto = FontData::from_blob(Arc::new(data), index);
-        fonts
-            .font_data
-            .insert("noto-cjk".to_owned(), Arc::new(noto));
+        // 預設字體 = Lilex (Latin/數字/等寬); 中文墊底 Noto Sans CJK.
+        // 讀取主字體失敗時(如未部署過/路徑被改)退回直接以 Noto CJK 當主字體, 不讓 App 直接炸
+        let mut primary_is_cjk_fallback = false;
+        let primary_data = std::fs::read(font_path)
+            .or_else(|e| {
+                eprintln!("[font] {font_path}: {e}; fallback to Noto Sans CJK");
+                primary_is_cjk_fallback = true;
+                std::fs::read(CJK_PATH)
+            })
+            .map_err(|e| format!("read {font_path}/{CJK_PATH}: {e}"))?;
+        let mut fonts = FontDefinitions::default();
+        let mut chain = vec!["primary".to_owned()];
+        fonts.font_data.insert(
+            "primary".to_owned(),
+            Arc::new(FontData::from_blob(Arc::new(primary_data), index)),
+        );
+        // CJK 墊底: 與主字體同檔時不重複插入
+        if font_path != CJK_PATH && !primary_is_cjk_fallback {
+            if let Ok(cjk) = std::fs::read(CJK_PATH) {
+                fonts.font_data.insert(
+                    "noto-cjk".to_owned(),
+                    Arc::new(FontData::from_blob(Arc::new(cjk), 0)),
+                );
+                chain.push("noto-cjk".to_owned());
+            }
+        }
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
             fonts
                 .families
                 .entry(family)
                 .or_default()
-                .splice(0..0, ["noto-cjk".to_owned()]);
+                .splice(0..0, chain.clone());
         }
         let ctx = egui::Context::default();
         ctx.set_fonts(fonts);
@@ -2592,8 +2659,11 @@ fn draw_ui(
                 ),
             };
             idx += 1;
+            let window_id = egui::Id::unique(("shortcut-window", name.as_str()));
             if let Some(r) = egui::Window::new(&name)
+                .id(window_id)
                 .collapsible(true)
+                .default_open(!state.shortcut_groups[group_idx].collapsed)
                 .resizable(state.shortcut_groups[group_idx].free_position)
                 .movable(state.shortcut_groups[group_idx].free_position)
                 .constrain(!state.shortcut_groups[group_idx].allow_out_of_bounds)
@@ -2621,9 +2691,22 @@ fn draw_ui(
                             ui.allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
                                 ui.columns(row.len(), |cols| {
                                     for (col, chip) in cols.iter_mut().zip(row) {
+                                        // [stem]function 對應腳本 0 參函式: 渲染為開關預設關,
+                                        // 不進積極按壓 (Bool 開關會被每幀呼叫翻動、首按奇偶漂掉)
+                                        let lua_toggle = parse_shortcut_label(chip).is_some_and(|(stem, function)| {
+                                            state.lua_scripts.iter().any(|s| {
+                                                crate::lua_env::script_name_matches_stem(
+                                                    &s.file_name,
+                                                    &stem,
+                                                ) && lua_env::is_zero_arg_function(s, &function)
+                                            })
+                                        });
                                         // 開關式捷徑 (點擊後被判定為回 Bool 的按鈕): selectable 渲染且不進按壓積極呼叫
-                                        let toggle_on =
-                                            state.shortcut_toggles.get(chip.as_str()).copied();
+                                        let toggle_on = state
+                                            .shortcut_toggles
+                                            .get(chip.as_str())
+                                            .copied()
+                                            .or(lua_toggle.then_some(false));
                                         let resp = match toggle_on {
                                             Some(on) => col.add_sized(
                                                 col.available_size(),
@@ -2652,7 +2735,7 @@ fn draw_ui(
                                                         .lua_scripts
                                                         .iter()
                                                         .find(|s| {
-                                                            s.file_name == format!("{stem}.lua")
+                                                            crate::lua_env::script_name_matches_stem(&s.file_name, &stem)
                                                         })
                                                         .filter(|s| {
                                                             lua_env::is_zero_arg_function(
@@ -2666,7 +2749,7 @@ fn draw_ui(
                                                         .lua_scripts
                                                         .iter_mut()
                                                         .find(|s| {
-                                                            s.file_name == format!("{stem}.lua")
+                                                            crate::lua_env::script_name_matches_stem(&s.file_name, &stem)
                                                         })
                                                         .map(|s| (s, function))
                                                 })
@@ -2695,7 +2778,16 @@ fn draw_ui(
                     });
                 })
             {
-                state.shortcut_groups[group_idx].window_geom = Some(r.response.rect);
+                // 恢復摺疊狀態: 依載入值設定預設展開; 折疊狀態由 CollapsingState 持有, 需自行讀出存檔
+                let collapsing_id = window_id.with("collapsing");
+                let open = egui::containers::collapsing_header::CollapsingState::load(ctx, collapsing_id)
+                    .map(|c| c.is_open())
+                    .unwrap_or(!state.shortcut_groups[group_idx].collapsed);
+                state.shortcut_groups[group_idx].collapsed = !open;
+                if open {
+                    // 只在展開時回寫幾何: 折疊中 rect 形如標題欄, 記錄下來會讓下次恢復成摺疊尺寸
+                    state.shortcut_groups[group_idx].window_geom = Some(r.response.rect);
+                }
                 hit_rects.push(r.response.rect.expand(8.0));
             }
         }
@@ -3027,8 +3119,11 @@ fn draw_scan_controls(
         "新一輪掃描(依目標值)"
     };
 
-    egui::Panel::bottom("scan-buttons")
+    // 分割線自畫 8px 兩端收與中央面板對齊, 內容 panel 保持 edge-to-edge
+    let separator_stroke = ui.style().visuals.widgets.noninteractive.bg_stroke;
+    let buttons_resp = egui::Panel::bottom("scan-buttons")
         .resizable(false)
+        .show_separator_line(false)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let (span_bytes, _) = selected_map_totals(state);
@@ -3055,7 +3150,10 @@ fn draw_scan_controls(
                     ));
                 }
             });
-            let refine_enabled = !state.scan.typed.is_empty() || state.scan.blocks.is_some();
+            // 篩選鍵啟用矩陣: 256B 與 condition_mode_enabled 同步 (Snapshot=建立區塊快照任何時機可用);
+            // 常規型別空結果時即使條件靜態可用(目標值/範圍)也沒有可篩對象, 篩選鍵停用
+            let refine_enabled = condition_mode_enabled(state, state.change_mode)
+                && (state.scan_slot.is_interval() || !state.scan.typed.is_empty());
             equal_row(ui, 2, |cols| {
                 let refine = cols[0]
                     .centered_and_justified(|ui| {
@@ -3074,6 +3172,12 @@ fn draw_scan_controls(
                 }
             });
         });
+    let rect = buttons_resp.response.rect;
+    ui.painter().hline(
+        egui::Rangef::new(rect.left() + 8.0, rect.right() - 8.0),
+        rect.top() - 0.5,
+        separator_stroke,
+    );
 
     ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -3086,6 +3190,7 @@ fn draw_scan_controls(
                     draw_type_grid(ui, state, actions, &TypeSlot::MAIN);
                     ui.add_space(8.0);
 
+                    // 有符號切換一律顯示; 實際只作用於 S32/S64/S16 (u8 是 enum, 步進界與預覽判別不走簽號邏輯)
                     if !state.scan_slot.is_interval() {
                         ui.horizontal(|ui| {
                             if ui.add(RadioButton::new(state.signed, "有符號")).clicked() {
@@ -3115,11 +3220,29 @@ fn draw_scan_controls(
                 .open(Some(state.cond_open))
                 .show(ui, |ui| {
                     // 當前條件因模型切換被禁用時, 退回矩陣內第一個可用的條件
+                    // None = 空結果時全矩陣不可用, 保持 change_mode 不動
                     if !condition_mode_enabled(state, state.change_mode) {
-                        actions.push(UiAction::ChangeMode(enabled_fallback(state)));
+                        if let Some(m) = enabled_fallback(state) {
+                            actions.push(UiAction::ChangeMode(m));
+                        }
                     }
-                    ui.horizontal_wrapped(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
+                        // 只在複合型別/帶輸入框的控件前後加分隔線: condition_row 都帶輸入框 (composite),
+                        // 5 個純切換按鈕 (PlainButton) 前後不加線; 行首行尾不留懸空分隔線
+                        let mut prev_composite: Option<bool> = None;
+                        let mut emit = |ui: &mut egui::Ui, composite: bool| {
+                            match prev_composite {
+                                None => {}
+                                Some(prev) => {
+                                    if prev || composite {
+                                        flow_separator(ui);
+                                    }
+                                }
+                            }
+                            prev_composite = Some(composite);
+                        };
+                        emit(ui, true);
                         condition_row(ui, state, actions, ChangeMode::ExactValue);
                         for mode in [
                             ChangeMode::Snapshot,
@@ -3128,6 +3251,7 @@ fn draw_scan_controls(
                             ChangeMode::Increased,
                             ChangeMode::Decreased,
                         ] {
+                            emit(ui, false);
                             let selected = state.change_mode == mode;
                             let enabled = condition_mode_enabled(state, mode);
                             let button = Button::selectable(selected, mode.label());
@@ -3135,8 +3259,11 @@ fn draw_scan_controls(
                                 actions.push(UiAction::ChangeMode(mode));
                             }
                         }
+                        emit(ui, true);
                         condition_row(ui, state, actions, ChangeMode::IncreasedBy);
+                        emit(ui, true);
                         condition_row(ui, state, actions, ChangeMode::DecreasedBy);
+                        emit(ui, true);
                         condition_row(ui, state, actions, ChangeMode::Between);
                     });
                 });
@@ -3173,11 +3300,11 @@ fn condition_row(
             | ChangeMode::DecreasedBy
             | ChangeMode::Between
     );
-    // 两段式 Frame::group: 首帧量測, 次帧按缓存尺寸分配, 超宽由 horizontal_wrapped 判断换行;
-    // 与 Lua 页 framed_var 同款, 外框为原生 Frame::group, 不手绘.
+    // 流式兩段式排版: 首帧量測, 次帧按緩存寬度分配 (高度固定 FLOW_ITEM_H), 超寬由 horizontal_wrapped 判斷換行;
+    // 與 Lua 頁 vidget 流同款, 不包外框, Item 之間以垂直分隔線切分
     let id = ui.make_persistent_id(("condition-chip", mode as u8));
     framed_var(ui, id, |ui| {
-        var_chip(ui, |ui| {
+        ui.horizontal(|ui| {
             let mut changed = false;
             if enabled {
                 if ui.add(Button::selectable(selected, label)).clicked() {
@@ -3190,52 +3317,32 @@ fn condition_row(
                 if mode == ChangeMode::ExactValue && bool_slot {
                     draw_typed_input(ui, state, actions);
                 } else if is_range {
-                    let (font_id, text_color) = {
-                        let s = ui.style();
-                        (egui::TextStyle::Body.resolve(s), ui.visuals().text_color())
-                    };
-                    let measure = |text: &str| {
-                        ui.fonts_mut(|f| {
-                            f.layout_no_wrap(text.to_string(), font_id.clone(), text_color)
-                                .size()
-                                .x
-                        })
-                    };
-                    // TextEdit 無 content-autosize, 按文字寬量出 desired_width 來貼齊內容; DragValue 由 egui 自動量
-                    let field_w = |text: &str, hint: &str| {
-                        (measure(text).max(measure(hint)) + 16.0).max(48.0)
-                    };
-                    let min_w = field_w(&state.range_min, "Min");
-                    let max_w = field_w(&state.range_max, "Max");
-                    let mut min = state.range_min.clone();
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut min)
-                            .hint_text("Min")
-                            .char_limit(32)
-                            .desired_width(min_w),
-                    );
-                    if resp.changed() {
-                        actions.push(UiAction::SetRangeMin(min));
-                    }
-                    changed |= resp.changed();
-                    let mut max = state.range_max.clone();
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut max)
-                            .hint_text("Max")
-                            .char_limit(32)
-                            .desired_width(max_w),
-                    );
-                    if resp.changed() {
-                        actions.push(UiAction::SetRangeMax(max));
-                    }
-                    changed |= resp.changed();
+                    let a = draw_range_bound(ui, state, actions, true);
+                    let b = draw_range_bound(ui, state, actions, false);
+                    changed |= a || b;
                 } else {
                     changed = draw_numeric_drag(ui, state, actions);
                 }
             }
             changed
         })
+        .inner
     });
+}
+
+/// ValueType → i64 夾制界, 與預覽型別一致, 不受全域 有符號 切換影響
+/// (u8 是 enum 語義, 全域 signed 只作用於 S32/S64/S16 槽位)
+fn int_bounds_for_ty(ty: ValueType) -> (i64, i64) {
+    match ty {
+        ValueType::UInt8 => (0, u8::MAX as i64),
+        ValueType::Int16 => (i16::MIN as i64, i16::MAX as i64),
+        ValueType::UInt16 => (0, u16::MAX as i64),
+        ValueType::Int32 => (i32::MIN as i64, i32::MAX as i64),
+        ValueType::UInt32 => (0, u32::MAX as i64),
+        ValueType::Int64 => (i64::MIN, i64::MAX),
+        ValueType::UInt64 => (0, i64::MAX), // 8-byte 無符號由上層單獨處理
+        _ => (i32::MIN as i64, i32::MAX as i64),
+    }
 }
 
 /// 數值輸入一律 DragValue; state.input 為單一真相 (拖拉後寫回新的數字字串).
@@ -3283,8 +3390,7 @@ fn draw_numeric_drag(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAc
             resp.changed()
         }
         _ => {
-            let size = ty.size();
-            if size == 8 && !state.signed {
+            if matches!(ty, ValueType::UInt64) {
                 // u64 全範圍: 拖拉速度 1, 飽和夾制交給輸出格式
                 let parsed: u64 = raw.parse().unwrap_or(0);
                 let mut v = parsed;
@@ -3294,21 +3400,75 @@ fn draw_numeric_drag(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAc
                 }
                 resp.changed()
             } else {
-                let (min, max): (i64, i64) = match (size, state.signed) {
-                    (1, true) => (i8::MIN as i64, i8::MAX as i64),
-                    (1, false) => (0, u8::MAX as i64),
-                    (2, true) => (i16::MIN as i64, i16::MAX as i64),
-                    (2, false) => (0, u16::MAX as i64),
-                    (4, true) => (i32::MIN as i64, i32::MAX as i64),
-                    (4, false) => (0, u32::MAX as i64),
-                    (8, true) => (i64::MIN, i64::MAX),
-                    _ => (i32::MIN as i64, i32::MAX as i64),
-                };
+                let (min, max) = int_bounds_for_ty(ty);
                 let mut v: i64 = raw.parse().unwrap_or(0);
                 v = v.clamp(min, max);
                 let resp = ui.add(egui::DragValue::new(&mut v).range(min..=max));
                 if resp.changed() {
                     actions.push(UiAction::SetInput(format!("{v}")));
+                }
+                resp.changed()
+            }
+        }
+    }
+}
+
+/// 範圍邊界 DragValue, 與 Lua 變數頁同款; raw 由 SetRangeMin/SetRangeMax 承接 (單一真相),
+/// 解析失敗視為 0; 整數依型別位寬與符號做飽和夾制, 浮點用 speed 0.001; 文字標籤 + DragValue 排版
+fn draw_range_bound(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>, is_min: bool) -> bool {
+    let ty = state.scan_slot.ty(state.signed);
+    let (raw, axis) = if is_min {
+        (&state.range_min, "Min")
+    } else {
+        (&state.range_max, "Max")
+    };
+    let raw = raw.trim();
+    ui.label(RichText::new(format!("{axis}:")).monospace());
+    let set = if is_min {
+        UiAction::SetRangeMin as fn(String) -> UiAction
+    } else {
+        UiAction::SetRangeMax as fn(String) -> UiAction
+    };
+    match ty {
+        ValueType::Float32 | ValueType::Double => {
+            let max_dec = if ty == ValueType::Float32 { 4 } else { 6 };
+            let mut v: f64 = raw.parse().unwrap_or(0.0);
+            let resp = ui.add(
+                egui::DragValue::new(&mut v)
+                    .speed(0.001)
+                    .max_decimals(max_dec),
+            );
+            if resp.changed() {
+                actions.push(set(v.to_string()));
+            }
+            resp.changed()
+        }
+        ValueType::Ptr => {
+            let mut v: u64 = ty.parse(raw).unwrap_or(0);
+            let resp = ui.add(
+                egui::DragValue::new(&mut v)
+                    .speed(1.0)
+                    .hexadecimal(10, false, false),
+            );
+            if resp.changed() {
+                actions.push(set(format!("0x{v:x}")));
+            }
+            resp.changed()
+        }
+        _ => {
+            if matches!(ty, ValueType::UInt64) {
+                let mut v: u64 = raw.parse().unwrap_or(0);
+                let resp = ui.add(egui::DragValue::new(&mut v).speed(1.0));
+                if resp.changed() {
+                    actions.push(set(v.to_string()));
+                }
+                resp.changed()
+            } else {
+                let (min, max) = int_bounds_for_ty(ty);
+                let mut v: i64 = raw.parse().unwrap_or(0).clamp(min, max);
+                let resp = ui.add(egui::DragValue::new(&mut v).range(min..=max));
+                if resp.changed() {
+                    actions.push(set(v.to_string()));
                 }
                 resp.changed()
             }
@@ -3331,13 +3491,20 @@ fn estimate_scan_bytes(slot: TypeSlot, span_bytes: u64) -> u64 {
 // 條件可用性: (條件, 結果型別 → 預覽型別) 為依據; 需要結果快照的差異條件,
 // 僅在完全同型時放開 (不同型沒有可比對的基準快照, 256B 快照只存雜湊沒有位元組),
 // Bit/Bool 只有「變化 / 原樣」, 沒有定量語意; 256B 視圖只有快照與區塊雜湊比對。
-// 「快照」不需快照, 任何時機都可用, 用作沒有可比對基線時的基線重建。
+// 「快照」有兩套語義: 256B 區塊是「從零建立凍結基線」, 作為入口任何時機可用;
+// 常規型別是「以當前結果重建凍結基線」, 空結果無處可重凍結。
+// 常規型別: 目標值/範圍是首掃入口與篩選條件, 永遠可用;
+// 差異與重凍結條件需既有結果 (及完全同型/非 bool 語意), 空結果一律停用;
+// 256B 的 AnyChange/Unchanged 需既有區塊基線, 其餘不放開。
 fn condition_mode_enabled(state: &AppState, mode: ChangeMode) -> bool {
+    let has_results = !state.scan.typed.is_empty();
     if state.scan_slot.is_interval() {
-        return matches!(
-            mode,
-            ChangeMode::Snapshot | ChangeMode::AnyChange | ChangeMode::Unchanged
-        );
+        return match mode {
+            // 建立區塊快照: 256B 入口, 任何時機可用
+            ChangeMode::Snapshot => true,
+            ChangeMode::AnyChange | ChangeMode::Unchanged => state.scan.blocks.is_some(),
+            _ => false,
+        };
     }
     let ty = state.scan_slot.ty(state.signed);
     let same = ty == state.frozen_ty;
@@ -3347,24 +3514,24 @@ fn condition_mode_enabled(state: &AppState, mode: ChangeMode) -> bool {
         ValueType::Bool | ValueType::BoolBit | ValueType::StringUtf16 | ValueType::StringUtf8
     );
     match mode {
-        // 記錄快照: 任何時機可用
-        ChangeMode::Snapshot => true,
-        // 目標值: 只讀當前值, 無需快照
+        // 目標值/範圍: 絕對值條件, 首掃與篩選共用; 與結果存不存在無關; bool/bit 沒有範圍語意
         ChangeMode::ExactValue => true,
-        // 區間: 只讀量, 無需快照; bool/bit 沒有範圍語意
         ChangeMode::Between => !bool_like,
+        // 記錄快照(常規): 以既有結果重建凍結基線, 空結果不可用
+        ChangeMode::Snapshot => has_results,
         // 差異 (任意變化/原樣): 需完全同型, 但 Bit/Bool 只有變或原
-        ChangeMode::AnyChange | ChangeMode::Unchanged => same,
+        ChangeMode::AnyChange | ChangeMode::Unchanged => has_results && same,
         // 定量增減 (含按量): 需完全同型且非 bool/bit
         ChangeMode::Increased
         | ChangeMode::Decreased
         | ChangeMode::IncreasedBy
-        | ChangeMode::DecreasedBy => same && !bool_like,
+        | ChangeMode::DecreasedBy => has_results && same && !bool_like,
     }
 }
 
 /// 同型優先順序: 差異條件 > 目標值 > 快照; 找第一個可用的頂替
-fn enabled_fallback(state: &AppState) -> ChangeMode {
+/// None = 空結果時沒有任何可用條件, 呼叫方不應切換 change_mode
+fn enabled_fallback(state: &AppState) -> Option<ChangeMode> {
     const PRIORITY: [ChangeMode; 9] = [
         ChangeMode::AnyChange,
         ChangeMode::Unchanged,
@@ -3376,10 +3543,7 @@ fn enabled_fallback(state: &AppState) -> ChangeMode {
         ChangeMode::DecreasedBy,
         ChangeMode::Between,
     ];
-    PRIORITY
-        .into_iter()
-        .find(|&m| condition_mode_enabled(state, m))
-        .unwrap_or(ChangeMode::Snapshot)
+    PRIORITY.into_iter().find(|&m| condition_mode_enabled(state, m))
 }
 
 fn draw_fuzzy_results(ui: &mut egui::Ui, base: &mem::FuzzyBase) {
@@ -3410,6 +3574,7 @@ fn draw_fuzzy_results(ui: &mut egui::Ui, base: &mem::FuzzyBase) {
             .striped(true)
             .resizable(true)
             .vscroll(true)
+            .min_scrolled_height(50.0)
             .sense(egui::Sense::click())
             .drag_to_scroll(egui::scroll_area::DragScroll::Always)
             .column(Column::initial(range_w).at_least(120.0).clip(true))
@@ -3561,6 +3726,7 @@ fn draw_results(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<UiAction>
             .striped(true)
             .resizable(true)
             .vscroll(true)
+            .min_scrolled_height(50.0)
             .sense(egui::Sense::click())
             .drag_to_scroll(egui::scroll_area::DragScroll::Always)
             .column(Column::initial(addr_w).at_least(40.0).clip(true))
@@ -3820,9 +3986,26 @@ fn draw_lua(ui: &mut egui::Ui, state: &mut AppState) {
         .show(ui, |ui| {
             for idx in 0..state.lua_scripts.len() {
                 let name = state.lua_scripts[idx].file_name.clone();
-                CollapsingHeader::new(&name)
-                    .default_open(true)
-                    .show(ui, |ui| draw_lua_script(ui, state, idx));
+                let enabled = state.lua_scripts[idx].enabled;
+                let id = ui.make_persistent_id(("lua_script", &name));
+                egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+                    .show_header(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(&name);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let mut on = enabled;
+                                let response = toggle_switch(ui, &mut on);
+                                if response.changed() {
+                                    lua_env::set_script_enabled(&mut state.lua_scripts[idx], on);
+                                    crate::lua_env::save_configs(&state.lua_scripts);
+                                    state.bump();
+                                }
+                            });
+                        });
+                    })
+                    .body(|ui| {
+                        ui.add_enabled_ui(enabled, |ui| draw_lua_script(ui, state, idx));
+                    });
                 ui.add_space(4.0);
             }
         });
@@ -3866,8 +4049,8 @@ fn draw_lua_script(ui: &mut egui::Ui, state: &mut AppState, idx: usize) {
     }
 
     if !variables.is_empty() {
-        ui.label("變量");
-        // 行內流式排版, 與掃描頁「條件」同款行為: 超寬換行
+        ui.label("變數");
+        // 行內流式排版, 與掃描頁「條件」同款行為: 超寬換行, Item 之間以垂直分隔線切分
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             draw_lua_variables_flow(ui, state, idx, &variables);
@@ -3883,7 +4066,15 @@ fn draw_lua_variables_flow(
     variables: &[String],
 ) {
     let mut i = 0;
+    let mut first = true;
+    let mut item = |ui: &mut egui::Ui| {
+        if !first {
+            flow_separator(ui);
+        }
+        first = false;
+    };
     while i < variables.len() {
+        item(ui);
         if i + 1 < variables.len() {
             match vector_group(&state.lua_scripts[idx], variables, i) {
                 Some(VectorGroup::Vec3(prefix, x, y, z)) => {
@@ -3904,13 +4095,20 @@ fn draw_lua_variables_flow(
     }
 }
 
-/// 變量 chip 兩段式排版: 有尺寸緩存時按緩存寬分配, 超寬換行由 horizontal_wrapped 判斷;
-/// 內容有變 (changed) 時失效緩存, 下一幀重量。外框為原生 Frame::group, 不手繪框線。
+/// 流式 Item 統一高度: 24px (TextStyle::Body 13px 下 text_edit = max(row_height+4, interact_size.y=20),
+/// label/button/DragValue/toggle = 20px; 取 24 留 1-2px 餘裕且為整數像素).
+/// Align::Center + wrapped 流, 高度只要不一致, center 參考線就會逐項漂, 視覺成階梯;
+/// 強制統一配置高度是消除階梯的前提, 與對齊方式成對存在
+const FLOW_ITEM_H: f32 = 24.0;
+
+/// 兩段式排版: 有尺寸緩存時按緩存寬 (高固定 FLOW_ITEM_H) 分配, 超寬換行由 horizontal_wrapped 判斷;
+/// 內容有變 (changed) 時失效緩存, 下一幀重量。
 /// 無緩存(如剛進頁面)時獨佔一行並量測, 配合 request_discard 令本幀重排為緩存尺寸。
 /// add 在量測幀與正式幀各執行一次; 量測幀無事件輸入, 其中的 changed() 必為 false,
 /// 故 set_global 等寫回只會在正式幀觸發。回傳 true 表示內容有變
 fn framed_var(ui: &mut egui::Ui, id: egui::Id, add: impl FnOnce(&mut egui::Ui) -> bool) {
     if let Some(size) = ui.data_mut(|data| data.get_temp::<Vec2>(id)) {
+        let size = Vec2::new(size.x, FLOW_ITEM_H);
         let changed = ui
             .allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| add(ui))
             .inner;
@@ -3933,7 +4131,7 @@ fn framed_var(ui: &mut egui::Ui, id: egui::Id, add: impl FnOnce(&mut egui::Ui) -
     );
     let _ = add(&mut child);
     let size = child.min_rect().size();
-    ui.data_mut(|data| data.insert_temp(id, size));
+    ui.data_mut(|data| data.insert_temp(id, Vec2::new(size.x, FLOW_ITEM_H)));
 }
 
 /// iOS-style toggle switch(egui 官方範例 widget,跟隨主題)
@@ -3968,11 +4166,9 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     response
 }
 
-/// Chip 內容: 原生 Frame::group 外框 + 水平排版, 回傳內部是否有變
-fn var_chip(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> bool) -> bool {
-    Frame::group(ui.style())
-        .show(ui, |ui| ui.horizontal(add).inner)
-        .inner
+/// 流式 Item 之間的垂直分隔線; egui Separator 在水平流中自動成直線, 滿行高 (不內縮)
+fn flow_separator(ui: &mut egui::Ui) {
+    ui.add(egui::Separator::default());
 }
 
 /// Vector 複合型別識別結果
@@ -4023,7 +4219,10 @@ fn vector_group(script: &lua_env::LuaScript, vars: &[String], i: usize) -> Optio
     Some(VectorGroup::Vec2(prefix.to_string(), a.clone(), y.clone()))
 }
 
-/// Vector 元素: 軸標籤 + DragValue, 回傳是否改變
+/// mlua 把精確整數值 float 降級為 Integer 子型別 (globals.set(x, 2.0f64) 讀回 Integer(2)),
+/// 編輯到 0/整數後變量型被編輯器鎖成整數, 小數點永遠不可編輯.
+/// Vector 元素: 軸標籤 + DragValue, 全部以 float 編輯;
+/// mlua 會把精確整數自動降級為 Integer 子型別, 寫回 Number 時再降級, 數值不失真
 fn vector_scalar(
     ui: &mut egui::Ui,
     script: &mut lua_env::LuaScript,
@@ -4032,28 +4231,21 @@ fn vector_scalar(
 ) -> bool {
     use mlua::Value;
     ui.label(RichText::new(format!("{axis}:")).monospace());
-    match script
+    let value = script
         .lua
         .globals()
         .get::<Value>(name)
-        .unwrap_or(Value::Nil)
-    {
-        Value::Integer(mut n) => {
-            let response = ui.add(egui::DragValue::new(&mut n).speed(1));
-            if response.changed() {
-                lua_env::set_global(script, name, Value::Integer(n));
-            }
-            response.changed()
-        }
-        Value::Number(mut v) => {
-            let response = ui.add(egui::DragValue::new(&mut v).speed(0.001).max_decimals(4));
-            if response.changed() {
-                lua_env::set_global(script, name, Value::Number(v));
-            }
-            response.changed()
-        }
-        _ => unreachable!(),
+        .unwrap_or(Value::Nil);
+    let mut v: f64 = match value {
+        Value::Number(v) => v,
+        Value::Integer(n) => n as f64,
+        _ => return false,
+    };
+    let response = ui.add(egui::DragValue::new(&mut v).speed(0.001).max_decimals(4));
+    if response.changed() {
+        lua_env::set_global(script, name, Value::Number(v));
     }
+    response.changed()
 }
 
 /// Vector2 複合型別控件: 兩個純量 X/Y 同一 chip 内編輯; 仍是兩個獨立全局變數
@@ -4068,12 +4260,13 @@ fn draw_lua_vector2(
     let script = &mut state.lua_scripts[idx];
     let id = ui.make_persistent_id(("framed_var", script.file_name.as_str(), prefix, "v2"));
     framed_var(ui, id, |ui| {
-        var_chip(ui, |ui| {
+        ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{prefix}:")).monospace());
             let cx = vector_scalar(ui, script, x_name, "X");
             let cy = vector_scalar(ui, script, y_name, "Y");
             cx | cy
         })
+        .inner
     });
 }
 
@@ -4090,13 +4283,14 @@ fn draw_lua_vector3(
     let script = &mut state.lua_scripts[idx];
     let id = ui.make_persistent_id(("framed_var", script.file_name.as_str(), prefix, "v3"));
     framed_var(ui, id, |ui| {
-        var_chip(ui, |ui| {
+        ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{prefix}:")).monospace());
             let cx = vector_scalar(ui, script, x_name, "X");
             let cy = vector_scalar(ui, script, y_name, "Y");
             let cz = vector_scalar(ui, script, z_name, "Z");
             cx | cy | cz
         })
+        .inner
     });
 }
 
@@ -4109,25 +4303,17 @@ fn draw_lua_variable(ui: &mut egui::Ui, idx: usize, name: &str, state: &mut AppS
         .get::<Value>(name)
         .unwrap_or(Value::Nil);
     match value {
-        Value::Integer(mut x) => {
+        Value::Integer(_) | Value::Number(_) => {
             let label = format!("{name}:");
             let id = ui.make_persistent_id(("framed_var", script.file_name.as_str(), name));
+            // 全部以 float 編輯; mlua 會把精確整數自動降級為 Integer 子型別, 數值不失真
+            let mut v: f64 = match value {
+                Value::Number(v) => v,
+                Value::Integer(n) => n as f64,
+                _ => unreachable!(),
+            };
             framed_var(ui, id, |ui| {
-                var_chip(ui, |ui| {
-                    ui.label(RichText::new(&label).monospace());
-                    let response = ui.add(egui::DragValue::new(&mut x).speed(1));
-                    if response.changed() {
-                        lua_env::set_global(script, name, Value::Integer(x));
-                    }
-                    response.changed()
-                })
-            });
-        }
-        Value::Number(mut v) => {
-            let label = format!("{name}:");
-            let id = ui.make_persistent_id(("framed_var", script.file_name.as_str(), name));
-            framed_var(ui, id, |ui| {
-                var_chip(ui, |ui| {
+                ui.horizontal(|ui| {
                     ui.label(RichText::new(&label).monospace());
                     let response =
                         ui.add(egui::DragValue::new(&mut v).speed(0.001).max_decimals(4));
@@ -4136,13 +4322,14 @@ fn draw_lua_variable(ui: &mut egui::Ui, idx: usize, name: &str, state: &mut AppS
                     }
                     response.changed()
                 })
+                .inner
             });
         }
         Value::Boolean(mut b) => {
             let label = format!("{name}:");
             let id = ui.make_persistent_id(("framed_var", script.file_name.as_str(), name));
             framed_var(ui, id, |ui| {
-                var_chip(ui, |ui| {
+                ui.horizontal(|ui| {
                     ui.label(RichText::new(&label).monospace());
                     let response = toggle_switch(ui, &mut b);
                     if response.changed() {
@@ -4150,6 +4337,7 @@ fn draw_lua_variable(ui: &mut egui::Ui, idx: usize, name: &str, state: &mut AppS
                     }
                     response.changed()
                 })
+                .inner
             });
         }
         other => match other {
@@ -4158,7 +4346,7 @@ fn draw_lua_variable(ui: &mut egui::Ui, idx: usize, name: &str, state: &mut AppS
                 let label = format!("{name}:");
                 let id = ui.make_persistent_id(("framed_var", script.file_name.as_str(), name));
                 framed_var(ui, id, |ui| {
-                    var_chip(ui, |ui| {
+                    ui.horizontal(|ui| {
                         ui.label(RichText::new(&label).monospace());
                         let font_id = egui::TextStyle::Body.resolve(ui.style());
                         let text_w = ui
@@ -4176,10 +4364,11 @@ fn draw_lua_variable(ui: &mut egui::Ui, idx: usize, name: &str, state: &mut AppS
                                 Err(e) => script.error = Some(format!("{name}: {e}")),
                             }
                         }
-                        response.changed()
-                    })
-                });
-            }
+                    response.changed()
+                })
+                .inner
+            });
+        }
             kind => {
                 let label = match kind {
                     Value::Nil => "nil",
@@ -4685,6 +4874,19 @@ fn draw_settings_body(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec
                     actions.push(UiAction::SetHexRefreshInterval(secs));
                 }
             });
+        });
+
+    egui::CollapsingHeader::new("除錯工具")
+        .default_open(true)
+        .show(ui, |ui| {
+            settings_row(ui, "RW 記憶體傾印", |ui| {
+                ui.add_enabled_ui(!state.dumping, |ui| {
+                    if ui.button("開始傾印").clicked() {
+                        actions.push(UiAction::DumpMemory);
+                    }
+                });
+            });
+            ui.label(RichText::new(state.status.as_str()).monospace().small());
         });
 }
 

@@ -1,4 +1,8 @@
-﻿-- 3D→2D ViewProjection 矩陣 + 敵人 ESP (螢幕中心頂 ↔ 敵人 z+100 線) 與 3D 方塊
+﻿--!strict
+-- 引擎注入的全域表: cast 成 any 讓型別分析器別再報未知全域, 執行時無效果
+local theraohe = (_G :: any).theraohe
+
+-- 3D→2D ViewProjection 矩陣 + 敵人 ESP (螢幕中心頂 ↔ 敵人 z+100 線) 與 3D 方塊
 -- 位置: APlayerCameraManager 相機快取 +0x530 (世界, cm)
 -- 位向: CameraCache POV (pcm+0x548, FRotator 角度) — 與位置和 FOV 同源, 含開鏡 ADS 位移與呼吸 sway
 -- 為什麼不能用 ctrl+0x4E0 (ControlRotation): 它是純輸入朝向, 不疊加開鏡時實際渲染用的位移與 sway。
@@ -57,7 +61,18 @@ type Camera = {
     aspect: number,
     my_team: number?,
 }
+-- 一幀的完整只讀快照: 解析層產生, 應用層只消費, 不得反向讀記憶體
+type Snapshot = {
+    cam: Camera,
+    enemies: { Enemy },
+    actors_num: number,
+    reals: number,
+    bots: number,
+    own_z: number,
+    pad: { x: number, y: number, z: number, sx: number?, sy: number?, cw: number? }?,
+}
 
+-- 解析層: 讀取遊戲記憶體 -> Snapshot; 本區禁止任何 draw_*/touch_* 呼叫
 local module_candidates = { "libue4.so", "UE4", "Unreal", "Game", "PUBGM" }
 
 local CTRL_PATTERN = '[[[[[["%s"+0xFC70A70]+0x810]+0x78]+0x38]+0x78]+0x30]'
@@ -108,32 +123,32 @@ local BONE_TABLE_68 = { 5, 4, 1, 11, 33, 12, 34, 13, 35, 55, 59, 56, 60, 57, 61 
 -- 自瞄 (Lua 頁面公開)
 -- AimbotBone (0-based, 15 項繪製表順序: 頭=0 ... 右踝=14), 橙色連線; <0 = 不高亮。
 -- 繪製高亮與自瞄追蹤共用; 0 = 頭 (C++ 專案預設自瞄部位)
-AimbotBone = 0
+AimbotBone = 0 :: number
 -- 自瞄手指與行為 (Lua 頁面公開, 物理像素座標)
 -- 手指起手位: 該處有空白遊戲區域最佳; 會自動鉗位到螢幕內
-AimbotStartX = 2000
-AimbotStartY = 200
+AimbotStartX = 2000 :: number
+AimbotStartY = 200 :: number
 -- AimbotMultiplier (螢幕中心-敵人位置差 * 倍率 = 滑動距離); 涵蓋速度與鏡頭靈敏度
 -- Y=0 = 只水平瞄準 (自行壓槍), X 仍照常工作
-AimbotMultiplierX = 0.05
-AimbotMultiplierY = 0.0
+AimbotMultiplierX = 0.05 :: number
+AimbotMultiplierY = 0.05 :: number
 -- 單次滑動像素上限: 本次 dx,dy 合向量超過此值則忽略本幀滑動 (手指不落/不動), 每次忽略 print; <=0 = 不限制
-AimbotMaxDrag = 0
+AimbotMaxDrag = 25 :: number
 -- 畫自瞄用立方體 MinMax 包圍盒 (黃框, 所有可見敵人); ShowCenterCross 畫螢幕中心十字 (綠)
-ShowAimbotRect = true
-ShowCenterCross = true
+ShowAimbotRect = true :: boolean
+ShowCenterCross = true :: boolean
 -- 開火 (Lua 頁面公開): 與捷徑同按, 在 Aimbot_Pressing 收到的位置循環 按下→間隙→鬆開
 -- 連點手指固定 slot 8; 預設間隙 50ms; FireGap同時用於AutoTrigger
-FullyAutoTrigger = false
-FireGap = 0.05
+FullyAutoTrigger = false :: boolean
+FireGap = 0.05 :: number
 -- AutoTrigger閥值: 瞄準目標點到相機 Forward 軸線之垂距小於此值 (cm) 即進入連點循環 (30cm 實測值)
-AutoTriggerThreshold = 30
+AutoTriggerThreshold = 30 :: number
 -- 雷達 (Lua 頁面公開): Yaw 跟隨雷達 — 中心=自己 (相機 POV 位置), 上=相機視角 Yaw; 把敵人 world 映射到正方形上
 -- 雷達位置 (螢幕物理像素, 中心對齊): 預設 800,350; 尺寸=單邊 px (預設 350); 範圍=單邊對應世界長度 (米, 預設 240 → ±120m)
-RadarPosX = 800
-RadarPosY = 350
-RadarSize = 350
-RadarRange = 240
+RadarPosX = 900 :: number
+RadarPosY = 350 :: number
+RadarSize = 350 :: number
+RadarRange = 240 :: number
 
 -- 自瞄內部狀態 (不反射)
 local aim_finger_down: boolean = false
@@ -296,13 +311,6 @@ local function cube_minmax(corners: { [number]: { px: number, py: number, w: vec
     return min_x, min_y, max_x, max_y
 end
 
-local function draw_minmax_rect(min_x: number, min_y: number, max_x: number, max_y: number, r: number, g: number, b: number, a: number)
-    theraohe.draw_line(min_x, min_y, max_x, min_y, r, g, b, a)
-    theraohe.draw_line(max_x, min_y, max_x, max_y, r, g, b, a)
-    theraohe.draw_line(max_x, max_y, min_x, max_y, r, g, b, a)
-    theraohe.draw_line(min_x, max_y, min_x, min_y, r, g, b, a)
-end
-
 type BoneCtx = {
     i1: vector, i2: vector, i3: vector, origin: vector,
     indices: { number }, bone_data: number,
@@ -333,9 +341,11 @@ local function bone_c2w_context(actor: number): BoneCtx?
     local yz2, wx2 = qy * z2, qw * x2
     local xy2, wz2 = qx * y2, qw * z2
     local xz2, wy2 = qx * z2, qw * y2
-    local c11, c12, c13 = (1 - (yy2 + zz2)) * sx, (xy2 + wz2) * sx, (xz2 - wy2) * sx
-    local c21, c22, c23 = (xy2 - wz2) * sy, (1 - (xx2 + zz2)) * sy, (yz2 + wx2) * sy
-    local c31, c32, c33 = (xz2 + wy2) * sz, (yz2 - wx2) * sz, (1 - (xx2 + yy2)) * sz
+    -- Hamilton A(q): m01=xy-wz, m02=xz+yw, m10=xy+wz, m12=yz-xw, m20=xz-yw, m21=yz+xw
+    -- 舊版為轉置矩陣 (= A(q)ᵀ = 逆轉), 表現成骨骼在特定方向被否定
+    local c11, c12, c13 = (1 - (yy2 + zz2)) * sx, (xy2 - wz2) * sx, (xz2 + wy2) * sx
+    local c21, c22, c23 = (xy2 + wz2) * sy, (1 - (xx2 + zz2)) * sy, (yz2 - wx2) * sy
+    local c31, c32, c33 = (xz2 - wy2) * sz, (yz2 + wx2) * sz, (1 - (xx2 + yy2)) * sz
     local i1, i2, i3 = vec(c11, c21, c31), vec(c12, c22, c32), vec(c13, c23, c33)
     local origin = vec(tx, ty, tz)
     local bone_data = (theraohe.read_u64(mesh + CACHED_COMPONENT_SPACE_OFF) or 0) + BONES_DATA_BIAS
@@ -471,6 +481,12 @@ local function setup_camera(): Camera?
     }
 end
 
+-- 座標解密接點: PUBGM 部分版本加密 RelativeLocation; 目前原值直讀,
+-- MIKU 的 Enc_1..Enc_4 位元組級定義確認後再在此切換 (見 scan_enemy_roots 呼叫點)
+local function decode_location(root: number): (number?, number?, number?)
+    return theraohe.read_f32(root + 0x220), theraohe.read_f32(root + 0x224), theraohe.read_f32(root + 0x228)
+end
+
 -- 走訪 Actors, 過濾出存活敵人, 只記錄 root 投影級資訊 (actor / root 投影 / 根世界座標)
 -- 骨架與立方體角點是重成本: 只在需要時用 enemy_detail 對「候選」單個目標計算
 -- 回傳 (enemies, actors_num); 失敗回傳 (nil, 錯誤碼) — 與舊 enemy_lines 一致
@@ -506,9 +522,7 @@ local function scan_enemy_roots(cam: Camera): ({ Enemy }?, number?)
                 if not is_dead_state(state) and team and my_team and team ~= my_team and team > 0 then
                     local root = theraohe.read_u64(actor + 0x208)
                     if root and root ~= 0 then
-                        local x = theraohe.read_f32(root + 0x1e4)
-                        local y = theraohe.read_f32(root + 0x1e8)
-                        local z = theraohe.read_f32(root + 0x1ec)
+                        local x, y, z = decode_location(root)
                         if x and y and z then
                             local rpitch = theraohe.read_f32(root + RELATIVE_ROTATION_OFF) or 0.0
                             local ryaw = theraohe.read_f32(root + RELATIVE_ROTATION_OFF + 4) or 0.0
@@ -637,10 +651,129 @@ local function collect_enemies(cam: Camera): ({ Enemy }?, number?)
     return out, num
 end
 
+-- 產生本幀快照; verbose 才順帶算主角投影 (校驗用), 平常零額外讀取
+-- 失敗回傳 (nil, "camera") 或 (nil, 敵人列舉錯誤碼)
+local function build_snapshot(verbose: boolean): (Snapshot?, (number | string)?)
+    local cam = setup_camera()
+    if not cam then
+        return nil, "camera"
+    end
+    local enemies, anum = collect_enemies(cam)
+    if not enemies then
+        return nil, anum
+    end
+    local real, bot = 0, 0
+    for _, e in ipairs(enemies) do
+        if e.is_bot then
+            bot = bot + 1
+        else
+            real = real + 1
+        end
+    end
+    local own_root = theraohe.read_u64(cam.onself + 0x208)
+    local own_z = (own_root and theraohe.read_f32(own_root + 0x228)) or cam.pos.z
+    local pad
+    if verbose and own_root then
+        local rx, ry, rz = decode_location(own_root)
+        if rx and ry and rz then
+            local sx, sy, cw = project(cam.vp, vec(rx, ry, rz), cam.sw, cam.sh)
+            pad = { x = rx, y = ry, z = rz, sx = sx, sy = sy, cw = cw }
+        end
+    end
+    return {
+        cam = cam,
+        enemies = enemies,
+        actors_num = anum or 0,
+        reals = real,
+        bots = bot,
+        own_z = own_z,
+        pad = pad,
+    }, nil
+end
+
+-- 應用層: 消費 Snapshot; 本區禁止任何記憶體讀取
+local function draw_minmax_rect(min_x: number, min_y: number, max_x: number, max_y: number, r: number, g: number, b: number, a: number)
+    theraohe.draw_line(min_x, min_y, max_x, min_y, r, g, b, a)
+    theraohe.draw_line(max_x, min_y, max_x, max_y, r, g, b, a)
+    theraohe.draw_line(max_x, max_y, min_x, max_y, r, g, b, a)
+    theraohe.draw_line(min_x, max_y, min_x, min_y, r, g, b, a)
+end
+
+-- HUD: 真人/人機數計數 (永遠渲染, 0 也畫): 0 灰、>0 彩 (機器人綠 真人紅)
+local function hud_render(snap: Snapshot)
+    local cx = snap.cam.sw * 0.5
+    local bot_col = snap.bots > 0 and { 0, 255, 0 } or { 255, 255, 255 }
+    local real_col = snap.reals > 0 and { 255, 0, 0 } or { 255, 255, 255 }
+    theraohe.draw_text(cx, 100, 1, 0, string.format("機器人:%d", snap.bots), bot_col[1], bot_col[2], bot_col[3], nil, 2)
+    theraohe.draw_text(cx, 100, 0, 0, string.format("真人:%d", snap.reals), real_col[1], real_col[2], real_col[3], nil, 2)
+end
+
+-- Yaw 跟隨雷達: 田字正方框(白,淡) + 十字格 + 敵人 '○' + 面向線 (IntToRGB(team))
+-- 中心=自己 (相機 POV 位置), 上=相機視角 Yaw; 敵人面向線用 actor root ryaw
+local function radar_render(snap: Snapshot)
+    local cam, enemies = snap.cam, snap.enemies
+    local radar_size = RadarSize; local radar_range = RadarRange
+    if not (radar_size and radar_range and radar_size > 0 and radar_range > 0) then
+        return
+    end
+    local cx_r, cy_r = (RadarPosX or 800), (RadarPosY or 350)
+    local half = radar_size * 0.5
+    local range_cm = radar_range * 100.0
+    local k = radar_size / range_cm
+    theraohe.draw_line(cx_r - half, cy_r - half, cx_r + half, cy_r - half, 255, 255, 255, 204)
+    theraohe.draw_line(cx_r + half, cy_r - half, cx_r + half, cy_r + half, 255, 255, 255, 204)
+    theraohe.draw_line(cx_r + half, cy_r + half, cx_r - half, cy_r + half, 255, 255, 255, 204)
+    theraohe.draw_line(cx_r - half, cy_r + half, cx_r - half, cy_r - half, 255, 255, 255, 204)
+    -- 十字分隔, 田字 4 格
+    theraohe.draw_line(cx_r - half, cy_r, cx_r + half, cy_r, 255, 255, 255, 204)
+    theraohe.draw_line(cx_r, cy_r - half, cx_r, cy_r + half, 255, 255, 255, 204)
+    local yaw = cam.rot.yaw * DEG
+    local cyw, syw = math.cos(yaw), math.sin(yaw)
+    local fwd_x, fwd_y = cyw, syw
+    local right_x, right_y = -syw, cyw
+    for _, e in ipairs(enemies) do
+        local team = e.team or 1
+        local tr, tg, tb = int_to_rgb(team)
+        local dx, dy = e.x - cam.pos.x, e.y - cam.pos.y
+        local half_range = range_cm * 0.5
+        local f = dx * fwd_x + dy * fwd_y
+        local s = dx * right_x + dy * right_y
+        -- 超出範圍 → 映射到邊界上 (沿原方向縮放到方形邊緣)
+        if math.abs(f) > half_range or math.abs(s) > half_range then
+            local scale = math.min(half_range / math.max(math.abs(f), 1e-9), half_range / math.max(math.abs(s), 1e-9))
+            f = f * scale
+            s = s * scale
+        end
+        local px = cx_r + s * k
+        local py = cy_r - f * k
+        theraohe.draw_text(px, py, 0.5, 0.5, "◯", tr, tg, tb, nil, 2)
+        -- 高度差徽章: 敵高於/低於主角 → ▲(淺紅)/▼(淺藍) 繪於 ◯ 上方; |Δz|<50cm 不畫
+        local dz = e.z - snap.own_z
+        if dz >= 50.0 then
+            theraohe.draw_text(px, py, 0.5, 0.5, "▲", 255, 0, 0, nil, 0)
+        elseif dz <= -50.0 then
+            theraohe.draw_text(px, py, 0.5, 0.5, "▼", 0, 0, 255, nil, 0)
+        end
+        local eyaw = e.rot.yaw * DEG
+        local efx, efy = math.cos(eyaw), math.sin(eyaw)
+        local es = efx * right_x + efy * right_y
+        local ef = -(efx * fwd_x + efy * fwd_y)
+        local m = math.sqrt(es * es + ef * ef)
+        if m > 1e-6 then
+            local ux, uy = es / m, ef / m
+            local sx, sy = px + ux * 8.0, py + uy * 8.0 -- 面向線起始離圓心 8px (從圓邊界開始)
+            local ex, ey = px + ux * 50.0, py + uy * 50.0 -- 終點距圓心 50px (全長 42px)
+            theraohe.draw_line(sx, sy, ex, ey, tr, tg, tb, 255)
+        end
+    end
+end
+
 -- ESP 渲染: 天線線 / 立方體(近端全功能) / 骨骼連線 (高亮骨橙色); VP 供蓋角短柱重投影用
 -- 遠端回退 (not full): 只畫外接框 (Bot白/真人紅)
 -- 迭代順序: 遠 → 近 (遠先畫, 近覆蓋遠)
-local function esp_render(VP: { { number } }, enemies: { Enemy }, sw: number, sh: number)
+local function esp_render(snap: Snapshot)
+    local cam = snap.cam
+    local VP, enemies, sw, sh = cam.vp, snap.enemies, cam.sw, cam.sh
     local hr, hg, hbh = 255, 165, 0
     local hb = ((AimbotBone or -1) + 1)
     for i = #enemies, 1, -1 do
@@ -787,7 +920,8 @@ end
 -- enemies 直接複用 ESP 全詳細掃描結果 — 不重複走訪; 僅一個候選做詳細滑動
 -- ShowAimbotRect / ShowCenterCross 是全局調試信息: 未按下自瞄鈕也顯示候選矩形與中心十字
 -- AimbotRect 兩個語義: 黃框 = 可以接獲 (中心落在包圍盒); 紅框 = 正在追蹤快取目標 (脫框也畫)
-local function aim_tick(cam: Camera, enemies: { Enemy }): ()
+local function aim_tick(snap: Snapshot): ()
+    local cam, enemies = snap.cam, snap.enemies
     local sw, sh = cam.sw, cam.sh
     local cx, cy = sw * 0.5, sh * 0.5
     local nearest, nearest_d2
@@ -873,98 +1007,28 @@ function Tick(): ()
     ticks = ticks + 1
     local tick = ticks
     local verbose = tick % 120 == 1
-    local cam = setup_camera()
-    if not cam then
+    local snap, err = build_snapshot(verbose)
+    if not snap then
         if verbose then
-            print("相機鏈失敗")
+            if err == "camera" then
+                print("相機鏈失敗")
+            else
+                print("敵人列舉失敗", err)
+            end
         end
         return
     end
+    local cam = snap.cam
     local sw, sh = cam.sw, cam.sh
-    local enemies, anum = collect_enemies(cam)
-    if not enemies then
-        if verbose then
-            print("敵人列舉失敗", anum)
-        end
-        return
-    end
-    local real, bot = 0, 0
-    for _, e in ipairs(enemies) do
-        if e.is_bot then
-            bot = bot + 1
-        else
-            real = real + 1
-        end
-    end
-    -- 人數統計 (永遠渲染, 0 也畫): 0 灰、>0 彩 (機器人綠 真人紅); 重要性 Heading
-    local cx = sw * 0.5
-    local bot_col = bot > 0 and { 0, 255, 0 } or { 255, 255, 255 }
-    local real_col = real > 0 and { 255, 0, 0 } or { 255, 255, 255 }
-    theraohe.draw_text(cx, 100, 1, 0, string.format("機器人:%d", bot), bot_col[1], bot_col[2], bot_col[3], nil, 2)
-    theraohe.draw_text(cx, 100, 0, 0, string.format("真人:%d", real), real_col[1], real_col[2], real_col[3], nil, 2)
-    -- Yaw 跟隨雷達: 田字正方框(白,淡) + 十字格 + 敵人 '○' + 面向線 (IntToRGB(team))
-    local radar_size = RadarSize; local radar_range = RadarRange
-    if radar_size and radar_range and radar_size > 0 and radar_range > 0 then
-        local cx_r, cy_r = (RadarPosX or 800), (RadarPosY or 350)
-        local half = radar_size * 0.5
-        local range_cm = radar_range * 100.0
-        local k = radar_size / range_cm
-        theraohe.draw_line(cx_r - half, cy_r - half, cx_r + half, cy_r - half, 255, 255, 255, 110)
-        theraohe.draw_line(cx_r + half, cy_r - half, cx_r + half, cy_r + half, 255, 255, 255, 110)
-        theraohe.draw_line(cx_r + half, cy_r + half, cx_r - half, cy_r + half, 255, 255, 255, 110)
-        theraohe.draw_line(cx_r - half, cy_r + half, cx_r - half, cy_r - half, 255, 255, 255, 110)
-        -- 十字分隔, 田字 4 格
-        theraohe.draw_line(cx_r - half, cy_r, cx_r + half, cy_r, 255, 255, 255, 110)
-        theraohe.draw_line(cx_r, cy_r - half, cx_r, cy_r + half, 255, 255, 255, 110)
-        -- 正前方 = 相機 POV Yaw (視角朝向); 敵人面向線用 actor root ryaw
-        -- 主角 root z; 讀不到退回相機 POV z
-        local own_root = theraohe.read_u64(cam.onself + 0x208)
-        local own_z = (own_root and theraohe.read_f32(own_root + 0x1ec)) or cam.pos.z
-        local yaw = cam.rot.yaw * DEG
-        local cyw, syw = math.cos(yaw), math.sin(yaw)
-        local fwd_x, fwd_y = cyw, syw
-        local right_x, right_y = -syw, cyw
-        for _, e in ipairs(enemies) do
-            local team = e.team or 1
-            local tr, tg, tb = int_to_rgb(team)
-            local dx, dy = e.x - cam.pos.x, e.y - cam.pos.y
-            local half_range = range_cm * 0.5
-            local f = dx * fwd_x + dy * fwd_y
-            local s = dx * right_x + dy * right_y
-            -- 超出範圍 → 映射到邊界上 (沿原方向縮放到方形邊緣)
-            if math.abs(f) > half_range or math.abs(s) > half_range then
-                local scale = math.min(half_range / math.max(math.abs(f), 1e-9), half_range / math.max(math.abs(s), 1e-9))
-                f = f * scale
-                s = s * scale
-            end
-            local px = cx_r + s * k
-            local py = cy_r - f * k
-            theraohe.draw_text(px, py, 0.5, 0.5, "○", tr, tg, tb, nil, 2)
-            -- 高度差徽章: 敵高於/低於主角 → ▲(淺紅)/▼(淺藍) 繪於 ○ 上方; |Δz|<50cm 不畫
-            local dz = e.z - own_z
-            if dz >= 50.0 then
-                theraohe.draw_text(px, py, 0.5, 0.5, "▲", 255, 0, 0, nil, 1)
-            elseif dz <= -50.0 then
-                theraohe.draw_text(px, py, 0.5, 0.5, "▼", 0, 0, 255, nil, 1)
-            end
-            local eyaw = e.rot.yaw * DEG
-            local efx, efy = math.cos(eyaw), math.sin(eyaw)
-            local es = efx * right_x + efy * right_y
-            local ef = -(efx * fwd_x + efy * fwd_y)
-            local m = math.sqrt(es * es + ef * ef)
-            if m > 1e-6 then
-                local ivec = 30.0 / m
-                theraohe.draw_line(px, py, px + es * ivec, py + ef * ivec, tr, tg, tb, 255)
-            end
-        end
-    end
-    esp_render(cam.vp, enemies, sw, sh)
-    aim_tick(cam, enemies)
+    hud_render(snap)
+    radar_render(snap)
+    esp_render(snap)
+    aim_tick(snap)
 
     if not verbose then
         return
     end
-    print(string.format("actors num=%d drawn=%d", anum, #enemies))
+    print(string.format("actors num=%d drawn=%d", snap.actors_num, #snap.enemies))
     print(string.format(
         "cam pos %.2f %.2f %.2f rot(deg) %.4f %.4f %.4f fov %.2f near %.1f far %.1f screen %dx%d aspect %.6f",
         cam.pos.x, cam.pos.y, cam.pos.z, cam.rot.pitch, cam.rot.yaw, cam.rot.roll, cam.fov, cam.near, cam.far, sw, sh, cam.aspect))
@@ -975,20 +1039,14 @@ function Tick(): ()
     end
 
     -- 校驗: 主角 RootComponent 相對位置 ≈ 世界座標, 投影應落在螢幕偏下中央附近
-    local root = theraohe.read_u64(cam.onself + 0x208)
-    if root then
-        local rx = theraohe.read_f32(root + 0x1e4)
-        local ry = theraohe.read_f32(root + 0x1e8)
-        local rz = theraohe.read_f32(root + 0x1ec)
-        if rx and ry and rz then
-            local sx, sy, cw = project(VP, vec(rx, ry, rz), sw, sh)
-            if sx then
-                print(string.format(
-                    "pad root %.2f %.2f %.2f -> screen (%.1f, %.1f), w=%.2f",
-                    rx, ry, rz, sx, sy, cw))
-            else
-                print("pad 投影失敗 (cw=0)")
-            end
+    local pad = snap.pad
+    if pad then
+        if pad.sx then
+            print(string.format(
+                "pad root %.2f %.2f %.2f -> screen (%.1f, %.1f), w=%.2f",
+                pad.x, pad.y, pad.z, pad.sx, pad.sy, pad.cw))
+        else
+            print("pad 投影失敗 (cw=0)")
         end
     end
 end
@@ -1013,4 +1071,3 @@ AutoTrigger = function(): boolean
     end
     return autotrigger_on
 end
-

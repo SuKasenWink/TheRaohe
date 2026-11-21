@@ -4,7 +4,7 @@
 //! 2. 關閉應用(UiAction::ConfirmClose)
 //! 讀檔只在進程啟動時做一次。捷徑窗口的位置/大小由使用者拖動, 每幀以 draw_ui 的
 //! Window::show 返回的 rect 為單一真相回寫在 group 上, 存檔時直接寫進 group 記錄。
-//! 存值本身; 僅 `window` 允許缺席(大組沒被拖動、也沒畫出來時沒有值可存)。
+//! 摺疊狀態單列 `collapsed` 變數記錄; 摺疊中不回寫 size(避免把摺疊的標題欄高度當幾何)
 
 use crate::ui::{AppState, ShortcutGroup};
 use egui::{pos2, vec2};
@@ -34,6 +34,9 @@ struct PersistedGroup {
     free_position: bool,
     allow_out_of_bounds: bool,
     window: Option<PersistedWindow>,
+    // 舊 settings.toon 沒有此欄位時以 default 補上 (不摺疊, 符合默認)
+    #[serde(default)]
+    collapsed: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
@@ -105,6 +108,7 @@ pub(crate) fn load() -> LoadedSettings {
                             vec2(w.size_x, w.size_y),
                         )
                     });
+                    group.collapsed = g.collapsed;
                     group
                 })
                 .collect();
@@ -148,6 +152,7 @@ pub(crate) fn save(state: &AppState) {
                     size_x: rect.width(),
                     size_y: rect.height(),
                 }),
+                collapsed: g.collapsed,
             })
             .collect(),
     };

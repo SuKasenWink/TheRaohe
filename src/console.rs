@@ -1,7 +1,9 @@
-//! 終端台: 截獲本行程的 stdout / stderr, 供 egui 窗口原樣顯示。
-//! 不另立日誌管道 — println! / eprintln! 寫出的就是終端台的內容;
-//! 原 fd 保留副本, 截獲的同時照舊寫回去, logcat 等下游行為不變。
+//! 終端台: 截獲本行程的 stdout / stderr, 供 egui 窗口原樣顯示; 同時把截獲內容追加寫入
+//! 日誌檔 (THERAOHE_LOG, 缺省 /data/local/tmp/theraohe/theraohe.log), 讓行程內容不受
+//! 啟動方式影響 — println! / eprintln! 寫出的任何東西都能在裝置上事後查到。
+//! 不另立日誌管道 — println! / eprintln! 寫出的就是終端台的內容。
 
+use std::ffi::CString;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// 環形緩衝上限, 超出時從行首裁剪
@@ -49,15 +51,16 @@ pub fn init() {
     let console = Arc::new(Console {
         buf: Mutex::new(Vec::with_capacity(16 * 1024)),
     });
+    let log_path = std::env::var("THERAOHE_LOG")
+        .unwrap_or_else(|_| "/data/local/tmp/theraohe/theraohe.log".to_string());
+    let log_fd = unsafe {
+        let path = CString::new(log_path).unwrap_or_else(|_| CString::new("/data/local/tmp/theraohe/theraohe.log").unwrap());
+        libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND, 0o644)
+    };
     for fd in [1i32, 2i32] {
         unsafe {
-            let saved = libc::dup(fd);
-            if saved < 0 {
-                continue;
-            }
             let mut pipe_fds = [0i32; 2];
             if libc::pipe(pipe_fds.as_mut_ptr()) != 0 {
-                libc::close(saved);
                 continue;
             }
             libc::dup2(pipe_fds[1], fd);
@@ -77,10 +80,11 @@ pub fn init() {
                     }
                     let data = &chunk[..n as usize];
                     reader.push(data);
-                    libc::write(saved, data.as_ptr() as *const libc::c_void, data.len());
+                    if log_fd >= 0 {
+                        libc::write(log_fd, data.as_ptr() as *const libc::c_void, data.len());
+                    }
                 }
                 libc::close(read_end);
-                libc::close(saved);
             });
         }
     }

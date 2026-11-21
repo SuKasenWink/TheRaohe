@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 mod console;
 mod display;
+mod dump;
 mod gpu_render;
 mod lua_env;
 // 可選外掛: 刪除 src/mcp.rs 並移除此行與 mcp::start 呼叫即完成卸載; UI 不依賴此模組
@@ -16,6 +17,7 @@ mod persist;
 mod screenshot;
 mod sf_keys;
 mod sf_touch;
+mod toon_tables;
 mod ui;
 
 #[repr(C, align(16))]
@@ -331,7 +333,7 @@ fn parse_args() -> Args {
         show: false,
         touch: true,
         keys: true,
-        font: "/system/fonts/NotoSansCJK-Regular.ttc".to_string(),
+        font: "/data/local/tmp/theraohe/Fonts/Lilex/Lilex-VariableFont_wght.ttf".to_string(),
         font_index: None,
         screen_w: 1080,
         screen_h: 2400,
@@ -478,11 +480,10 @@ impl FrameCtx<'_> {
                         if !seen.insert((stem.clone(), function.clone())) {
                             continue;
                         }
-                        let file = format!("{stem}.lua");
                         if let Some(s) = state
                             .lua_scripts
                             .iter_mut()
-                            .find(|s| s.file_name == file)
+                            .find(|s| crate::lua_env::script_name_matches_stem(&s.file_name, &stem))
                         {
                             let _ = crate::lua_env::call(s, &function, pos);
                         }

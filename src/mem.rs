@@ -72,9 +72,7 @@ impl ScanFilter {
     fn matches(self, ty: ValueType, val: u64) -> bool {
         match self {
             ScanFilter::Exact(bits) => value_eq(ty, val, bits),
-            ScanFilter::Between { min, max } => {
-                compare(ty, val, min) != Ordering::Less && compare(ty, val, max) != Ordering::Greater
-            }
+            ScanFilter::Between { min, max } => between_in_range(ty, val, min, max),
         }
     }
 }
@@ -199,14 +197,14 @@ impl ChangeMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            ChangeMode::ExactValue => "目標值：",
+            ChangeMode::ExactValue => "目標值",
             ChangeMode::AnyChange => "任意變化",
             ChangeMode::Unchanged => "原樣",
             ChangeMode::Increased => "任意增大",
             ChangeMode::Decreased => "任意減少",
-            ChangeMode::IncreasedBy => "增加了：",
-            ChangeMode::DecreasedBy => "減少了：",
-            ChangeMode::Between => "範圍：",
+            ChangeMode::IncreasedBy => "增加了",
+            ChangeMode::DecreasedBy => "減少了",
+            ChangeMode::Between => "範圍",
             ChangeMode::Snapshot => "記錄快照",
         }
     }
@@ -364,7 +362,30 @@ fn wrapping_sub(ty: ValueType, a: u64, b: u64) -> u64 {
 }
 
 fn value_eq(ty: ValueType, a: u64, b: u64) -> bool {
-    compare(ty, a, b) == Ordering::Equal
+    match ty {
+        // 浮點精確比對按位元: partial_cmp 對 NaN 回 None, 走 Equal 會讓 NaN 匹配一切
+        ValueType::Float32 | ValueType::Double => a == b,
+        _ => compare(ty, a, b) == Ordering::Equal,
+    }
+}
+
+fn between_in_range(ty: ValueType, value: u64, min: u64, max: u64) -> bool {
+    // 浮點走明確比較, NaN 不在任何範圍; 整數比對仍走 compare
+    match ty {
+        ValueType::Float32 => {
+            let (v, lo, hi) = (
+                f32::from_bits(value as u32),
+                f32::from_bits(min as u32),
+                f32::from_bits(max as u32),
+            );
+            v >= lo && v <= hi
+        }
+        ValueType::Double => {
+            let (v, lo, hi) = (f64::from_bits(value), f64::from_bits(min), f64::from_bits(max));
+            v >= lo && v <= hi
+        }
+        _ => compare(ty, value, min) != Ordering::Less && compare(ty, value, max) != Ordering::Greater,
+    }
 }
 
 fn refine_match(
@@ -387,9 +408,7 @@ fn refine_match(
             compare(ty, current, entry.bits) == Ordering::Less
                 && wrapping_sub(ty, entry.bits, current) == delta
         }
-        RefineFilter::Between { min, max } => {
-            compare(ty, current, min) != Ordering::Less && compare(ty, current, max) != Ordering::Greater
-        }
+        RefineFilter::Between { min, max } => between_in_range(ty, current, min, max),
     }
 }
 

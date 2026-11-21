@@ -2170,6 +2170,7 @@ dependencies = [
  "rmcp",
  "schemars",
  "serde",
+ "serde_json",
  "tokio",
  "toon-format",
  "xxhash-rust",
